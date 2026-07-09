@@ -7,7 +7,7 @@ static APARATKIDS_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static APARAT_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-  Regex::new(r"https?://(?:www\.)?aparat\.com/(?:w|m)/([a-zA-Z0-9]+)").unwrap()
+  Regex::new(r"https?://(?:www\.)?aparat\.com/(?:v|m)/([a-zA-Z0-9]+)").unwrap()
 });
 
 pub struct AparatkidsResolved {
@@ -27,6 +27,120 @@ pub async fn resolve_aparatkids_url(url: &str) -> Result<AparatkidsResolved, Str
     .build()
     .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
+  if APARAT_URL_RE.is_match(url) {
+    resolve_aparat_com(&client, url).await
+  } else {
+    resolve_aparatkids_com(&client, url).await
+  }
+}
+
+/// Resolve aparat.com URLs via their JSON API
+async fn resolve_aparat_com(
+  client: &reqwest::Client,
+  url: &str,
+) -> Result<AparatkidsResolved, String> {
+  let caps = APARAT_URL_RE
+    .captures(url)
+    .ok_or_else(|| "Invalid aparat.com URL".to_string())?;
+  let video_hash = caps.get(1).unwrap().as_str();
+
+  let api_url = format!(
+    "https://www.aparat.com/api/fa/v1/video/video/show/videohash/{}?pr=1&mf=1",
+    video_hash
+  );
+
+  let resp = client
+    .get(&api_url)
+    .header("Referer", "https://www.aparat.com/")
+    .header("Accept", "application/json")
+    .send()
+    .await
+    .map_err(|e| format!("Failed to fetch video API: {e}"))?;
+
+  let status = resp.status();
+  if !status.is_success() {
+    return Err(format!("Video API returned status {}", status));
+  }
+
+  let json: Value = resp
+    .json()
+    .await
+    .map_err(|e| format!("Failed to parse video API response: {e}"))?;
+
+  let attrs = json
+    .get("data")
+    .and_then(|d| d.get("attributes"))
+    .ok_or_else(|| "Invalid API response: missing video attributes".to_string())?;
+
+  // Extract m3u8 URL
+  let m3u8_url = extract_aparat_m3u8(attrs)?;
+
+  // Extract metadata
+  let title = attrs
+    .get("title")
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_string());
+
+  let thumbnail = attrs
+    .get("big_poster")
+    .or_else(|| attrs.get("medium_poster"))
+    .or_else(|| attrs.get("small_poster"))
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_string());
+
+  let duration = attrs
+    .get("duration")
+    .and_then(|v| v.as_f64())
+    .filter(|&d| d > 0.0);
+
+  Ok(AparatkidsResolved {
+    m3u8_url,
+    title,
+    thumbnail,
+    duration,
+  })
+}
+
+fn extract_aparat_m3u8(attrs: &Value) -> Result<String, String> {
+  // Try hls_link first
+  if let Some(hls) = attrs.get("hls_link").and_then(|v| v.as_str()) {
+    if !hls.is_empty() {
+      return Ok(hls.to_string());
+    }
+  }
+
+  // Try hls.link
+  if let Some(hls_obj) = attrs.get("hls") {
+    if let Some(link) = hls_obj.get("link").and_then(|v| v.as_str()) {
+      if !link.is_empty() {
+        return Ok(link.to_string());
+      }
+    }
+  }
+
+  // Try manifest field
+  if let Some(manifest) = attrs.get("manifest").and_then(|v| v.as_str()) {
+    if manifest.starts_with("#EXTM3U") {
+      // The manifest itself is m3u8 content - we need the URL, not content
+      // Fall through to file_link
+    }
+  }
+
+  // Try file_link as fallback (direct MP4)
+  if let Some(file_link) = attrs.get("file_link").and_then(|v| v.as_str()) {
+    if !file_link.is_empty() {
+      return Ok(file_link.to_string());
+    }
+  }
+
+  Err("No video stream found in API response".to_string())
+}
+
+/// Resolve aparatkids.com URLs by parsing the page HTML
+async fn resolve_aparatkids_com(
+  client: &reqwest::Client,
+  url: &str,
+) -> Result<AparatkidsResolved, String> {
   let html = client
     .get(url)
     .send()
@@ -36,13 +150,8 @@ pub async fn resolve_aparatkids_url(url: &str) -> Result<AparatkidsResolved, Str
     .await
     .map_err(|e| format!("Failed to read page content: {e}"))?;
 
-  let m3u8_url = extract_m3u8_url(&html).ok_or_else(|| {
-    if APARAT_URL_RE.is_match(url) {
-      "Aparat.com videos require JavaScript to load. Try using the aparatkids.com version of this video instead.".to_string()
-    } else {
-      "Failed to extract video URL from page. The video may require authentication or may not be available in your region.".to_string()
-    }
-  })?;
+  let m3u8_url =
+    extract_m3u8_url(&html).ok_or_else(|| "Failed to extract video URL from page".to_string())?;
 
   let title = extract_title(&html);
   let thumbnail = extract_thumbnail(&html);
@@ -103,15 +212,12 @@ fn extract_from_og_video(html: &str) -> Option<String> {
 }
 
 fn extract_title(html: &str) -> Option<String> {
-  // Try uxEvents.movie.nameFa first (Persian title)
   if let Some(name) = extract_ux_event_field(html, "nameFa") {
     return Some(name);
   }
-  // Try uxEvents.movie.nameEn (English title)
   if let Some(name) = extract_ux_event_field(html, "nameEn") {
     return Some(name);
   }
-  // Try <title> tag
   let re = Regex::new(r"<title>\s*(.+?)\s*</title>").ok()?;
   let caps = re.captures(html)?;
   let title = caps.get(1)?.as_str().trim().to_string();
@@ -135,11 +241,9 @@ fn extract_ux_event_field(html: &str, field: &str) -> Option<String> {
 }
 
 fn extract_thumbnail(html: &str) -> Option<String> {
-  // Try uxEvents.movie.poster
   if let Some(poster) = extract_ux_event_field(html, "poster") {
     return Some(poster);
   }
-  // Try og:image meta tag
   let re = Regex::new(r#"<meta\s+(?:property|name)=["']og:image["']\s+content=["']([^"']+)["']"#).ok()?;
   let caps = re.captures(html)?;
   let url = caps.get(1)?.as_str().trim().to_string();
@@ -151,7 +255,6 @@ fn extract_thumbnail(html: &str) -> Option<String> {
 }
 
 fn extract_duration(html: &str) -> Option<f64> {
-  // Try uxEvents.movie.totalDuration
   if let Some(dur_str) = extract_ux_event_field(html, "totalDuration") {
     if let Ok(dur) = dur_str.parse::<f64>() {
       if dur > 0.0 {
@@ -159,7 +262,6 @@ fn extract_duration(html: &str) -> Option<f64> {
       }
     }
   }
-  // Try video:duration meta tag
   let re = Regex::new(r#"<meta\s+(?:property|name)=["']video:duration["']\s+content=["'](\d+)["']"#).ok()?;
   let caps = re.captures(html)?;
   let dur_str = caps.get(1)?.as_str();
@@ -174,7 +276,8 @@ mod tests {
   fn test_is_aparatkids_url() {
     assert!(is_aparatkids_url("https://www.aparatkids.com/w/0oy3n"));
     assert!(is_aparatkids_url("https://www.aparatkids.com/m/118063"));
-    assert!(is_aparatkids_url("https://aparatkids.com/w/0oy3n"));
+    assert!(is_aparatkids_url("https://www.aparat.com/v/lyo8514"));
+    assert!(is_aparatkids_url("https://www.aparat.com/m/bdmq6"));
     assert!(!is_aparatkids_url("https://youtube.com/watch?v=abc"));
   }
 
@@ -208,5 +311,13 @@ mod tests {
     let dur = extract_duration(html);
     assert!(dur.is_some());
     assert_eq!(dur.unwrap(), 1071.0);
+  }
+
+  #[test]
+  fn test_aparat_url_patterns() {
+    assert!(APARAT_URL_RE.is_match("https://www.aparat.com/v/lyo8514"));
+    assert!(APARAT_URL_RE.is_match("https://www.aparat.com/m/bdmq6"));
+    assert!(APARAT_URL_RE.is_match("https://aparat.com/v/lyo8514"));
+    assert!(!APARAT_URL_RE.is_match("https://www.aparat.com/w/test"));
   }
 }
