@@ -1,0 +1,114 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
+pub enum ParsedMedia {
+  Single(ParsedSingleVideo),
+  Playlist(ParsedPlaylist),
+  Livestream(ParsedLivestream),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaCodec {
+  pub id: String,
+  pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaFormat {
+  pub id: String,
+  pub abr: Option<u64>,
+  pub height: Option<u64>,
+  pub fps: Option<u64>,
+  pub audio_codecs: Vec<MediaCodec>,
+  pub video_codecs: Vec<MediaCodec>,
+  pub audio_track_ids: Vec<String>,
+  pub video_track_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrack {
+  pub id: String,
+  pub label: String,
+  pub language: Option<String>,
+  pub language_preference: Option<i64>,
+  pub format_note: Option<String>,
+  pub format: Option<String>,
+  pub audio_channels: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleInventory {
+  pub manual_languages: Vec<String>,
+  pub auto_languages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Chapter {
+  pub title: String,
+  pub start_time: f64,
+  pub end_time: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedSingleVideo {
+  pub id: String,
+  pub url: Option<String>,
+  pub title: Option<String>,
+  pub thumbnail: Option<String>,
+  pub description: Option<String>,
+  pub uploader_id: Option<String>,
+  pub uploader: Option<String>,
+  pub views: Option<u64>,
+  pub comments: Option<u64>,
+  pub likes: Option<u64>,
+  pub dislikes: Option<u64>,
+  pub duration: Option<f64>,
+  pub rating: Option<f64>,
+  pub extractor: Option<String>,
+  pub video_codecs: Vec<MediaCodec>,
+  pub audio_codecs: Vec<MediaCodec>,
+  pub video_tracks: Vec<MediaTrack>,
+  pub audio_tracks: Vec<MediaTrack>,
+  pub formats: Vec<MediaFormat>,
+  pub subtitle_inventory: SubtitleInventory,
+  pub chapters: Vec<Chapter>,
+  pub filesize: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedPlaylist {
+  pub id: String,
+  pub url: Option<String>,
+  pub title: Option<String>,
+  pub thumbnail: Option<String>,
+  pub uploader: Option<String>,
+  pub uploader_id: Option<String>,
+  pub entries: Vec<PlaylistEntry>,
+  pub playlist_id: Option<String>,
+  pub playlist_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistEntry {
+  pub video_url: String,
+  pub index: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedLivestream {
+  pub id: String,
+  pub url: Option<String>,
+  pub title: Option<String>,
+  pub uploader: Option<String>,
+}

@@ -1,0 +1,529 @@
+use crate::models::progress::MediaDestinationPath;
+use crate::models::{
+  MediaDestination, MediaProgress, MediaProgressStage, ProgressCategory, ProgressEvent,
+  ProgressStage, TrackType,
+};
+use std::path::Path;
+
+pub struct YtdlpProgressParser {
+  id: String,
+  group_id: String,
+  current_category: ProgressCategory,
+  current_stage: ProgressStage,
+  partial_download_duration_secs: Option<f64>,
+}
+
+impl YtdlpProgressParser {
+  pub fn new(
+    id: &str,
+    group_id: &str,
+    initial_category: ProgressCategory,
+    partial_download_duration_secs: Option<f64>,
+  ) -> Self {
+    Self {
+      id: id.to_string(),
+      group_id: group_id.to_string(),
+      current_category: initial_category,
+      current_stage: ProgressStage::Initializing,
+      partial_download_duration_secs,
+    }
+  }
+
+  pub fn parse_line(&mut self, line: &str) -> Vec<ProgressEvent> {
+    let mut evts = Vec::new();
+
+    if let Some(evt) = self.try_destination(line) {
+      evts.push(evt);
+    }
+
+    if let Some(evt) = self.try_postprocess_stage(line) {
+      evts.push(evt);
+      return evts;
+    }
+
+    if let Some(evt) = self.try_download_stage(line) {
+      evts.push(evt);
+      return evts;
+    }
+
+    if let Some(evt) = self.try_progress_update(line) {
+      evts.push(evt);
+      return evts;
+    }
+
+    if let Some(progress) = self.try_ffmpeg_progress_update(line) {
+      if self.current_stage == ProgressStage::Initializing {
+        self.current_stage = ProgressStage::Downloading;
+        evts.push(ProgressEvent::StageChange(MediaProgressStage {
+          id: self.id.clone(),
+          group_id: self.group_id.clone(),
+          stage: self.current_stage.clone(),
+        }));
+      }
+      evts.push(progress);
+      return evts;
+    }
+
+    if let Some(evt) = self.try_merger_destination(line) {
+      evts.push(evt);
+    }
+
+    if let Some(evt) = self.try_merging_stage(line) {
+      evts.push(evt);
+      return evts;
+    }
+
+    if let Some(evt) = self.try_finalizing_stage(line) {
+      evts.push(evt);
+      return evts;
+    }
+
+    evts
+  }
+
+  fn try_merger_destination(&self, line: &str) -> Option<ProgressEvent> {
+    const PREFIX: &str = "[Merger] Merging formats into";
+    if let Some(rest) = line.strip_prefix(PREFIX) {
+      let destination = rest.trim().trim_matches('"').to_string();
+
+      return Some(ProgressEvent::Destination(MediaDestination {
+        id: self.id.clone(),
+        group_id: self.group_id.clone(),
+        is_merged: true,
+        destination: MediaDestinationPath {
+          confidence: 80,
+          path: destination,
+        },
+      }));
+    }
+    None
+  }
+
+  fn try_destination(&self, line: &str) -> Option<ProgressEvent> {
+    if let Some(path) = Self::extract_already_downloaded_path(line) {
+      return Some(ProgressEvent::Destination(MediaDestination {
+        id: self.id.clone(),
+        group_id: self.group_id.clone(),
+        destination: MediaDestinationPath {
+          confidence: 65,
+          path,
+        },
+        is_merged: false,
+      }));
+    }
+
+    if let Some(path) = Self::extract_remuxer_already_path(line) {
+      return Some(ProgressEvent::Destination(MediaDestination {
+        id: self.id.clone(),
+        group_id: self.group_id.clone(),
+        destination: MediaDestinationPath {
+          confidence: 90,
+          path,
+        },
+        is_merged: false,
+      }));
+    }
+
+    let (_, rest) = line.split_once("Destination:")?;
+    let full_path = rest.trim().to_string();
+
+    let tag = line
+      .split(']')
+      .next()
+      .map(|s| s.trim_start_matches('['))
+      .unwrap_or("unknown");
+
+    let confidence = match tag {
+      "VideoConvertor" => 95,
+      "VideoRemuxer" => 90,
+      "Merger" | "ExtractAudio" => 70,
+      "download" => 60,
+      _ => 50,
+    };
+
+    Some(ProgressEvent::Destination(MediaDestination {
+      id: self.id.clone(),
+      group_id: self.group_id.clone(),
+      destination: MediaDestinationPath {
+        confidence,
+        path: full_path,
+      },
+      is_merged: false,
+    }))
+  }
+
+  fn extract_already_downloaded_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("[download] ")?;
+    let (path, _) = rest.split_once(" has already been downloaded")?;
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+      None
+    } else {
+      Some(trimmed.to_string())
+    }
+  }
+
+  fn extract_remuxer_already_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("[VideoRemuxer] Not remuxing media file ")?;
+    let start = rest.find('"')?;
+    let after_start = &rest[start + 1..];
+    let end = after_start.find('"')?;
+    let trimmed = after_start[..end].trim();
+    if trimmed.is_empty() {
+      None
+    } else {
+      Some(trimmed.to_string())
+    }
+  }
+
+  fn try_download_stage(&mut self, line: &str) -> Option<ProgressEvent> {
+    if line.contains("[download] Destination:") {
+      if let Some(path) = line.trim().split("Destination:").nth(1) {
+        let ext = Path::new(path)
+          .extension()
+          .and_then(|e| e.to_str())
+          .unwrap_or("")
+          .to_ascii_lowercase();
+
+        self.current_category = match ext.as_str() {
+          "mp4" | "mkv" | "webm" | "flv" | "mov" | "avi" | "m4v" | "ts" | "m2ts" | "3gp" => {
+            ProgressCategory::Video
+          }
+          "mp3" | "m4a" | "wav" | "flac" | "ogg" | "opus" | "mka" | "aiff" | "wma" | "alac"
+          | "aac" => ProgressCategory::Audio,
+          "vtt" | "srt" | "ass" | "lrc" | "ttml" | "srv1" | "srv2" | "srv3" => {
+            ProgressCategory::Subtitles
+          }
+          "jpg" | "jpeg" | "png" | "webp" | "bmp" => ProgressCategory::Thumbnail,
+          "json" => ProgressCategory::Metadata,
+          _ => ProgressCategory::Other,
+        };
+      }
+      if self.current_stage != ProgressStage::Downloading {
+        self.current_stage = ProgressStage::Downloading;
+        return Some(ProgressEvent::StageChange(MediaProgressStage {
+          id: self.id.clone(),
+          group_id: self.group_id.clone(),
+          stage: self.current_stage.clone(),
+        }));
+      }
+    }
+    None
+  }
+
+  pub fn try_progress_update(&self, line: &str) -> Option<ProgressEvent> {
+    fn parse_opt_u64(s: &str) -> Option<u64> {
+      let t = s.trim();
+      if t.is_empty() || t.eq_ignore_ascii_case("na") {
+        None
+      } else {
+        t.parse().ok()
+      }
+    }
+    fn parse_opt_f64(s: &str) -> Option<f64> {
+      let t = s.trim();
+      if t.is_empty() || t.eq_ignore_ascii_case("na") {
+        None
+      } else {
+        t.parse().ok()
+      }
+    }
+    fn parse_opt_pct(s: &str) -> Option<f64> {
+      let t = s.trim().trim_end_matches('%').trim();
+      if t.is_empty() || t.eq_ignore_ascii_case("na") {
+        None
+      } else {
+        t.parse::<f64>().ok()
+      }
+    }
+
+    fn get_or_empty<'a>(parts: &[&'a str], i: usize) -> &'a str {
+      if i < parts.len() {
+        parts[i]
+      } else {
+        ""
+      }
+    }
+
+    const fn clamp01pct(p: f64) -> f64 {
+      if p.is_finite() {
+        p.clamp(0.0, 100.0)
+      } else {
+        0.0
+      }
+    }
+
+    let line = line.trim_end();
+    let raw = line.strip_prefix("RAW|")?;
+
+    // Expect 9 fields from a progress line, fewer is okay.
+    let mut parts: Vec<&str> = raw.split('|').collect();
+    while parts.len() < 9 {
+      parts.push("");
+    }
+
+    let pct_num = parse_opt_pct(get_or_empty(&parts, 0)); // progress.percent
+    let pct_str = parse_opt_pct(get_or_empty(&parts, 1)); // progress._percent_str
+    let speed_bps = parse_opt_f64(get_or_empty(&parts, 2)); // progress.speed (bytes/sec)
+    let eta_secs = parse_opt_u64(get_or_empty(&parts, 3)); // progress.eta (seconds)
+    let dl = parse_opt_u64(get_or_empty(&parts, 4)); // downloaded_bytes
+    let total = parse_opt_u64(get_or_empty(&parts, 5)); // total_bytes
+    let estimate = parse_opt_u64(get_or_empty(&parts, 6)); // total_bytes_estimate
+    let frag_i = parse_opt_u64(get_or_empty(&parts, 7)); // fragment_index
+    let frag_n = parse_opt_u64(get_or_empty(&parts, 8)); // fragment_count
+
+    let percentage = pct_num
+      .or(pct_str)
+      .or_else(|| {
+        let t = total.or(estimate)?;
+        let d = dl?;
+        if t == 0 {
+          None
+        } else {
+          Some((d as f64 / t as f64) * 100.0)
+        }
+      })
+      .or_else(|| {
+        let (i, n) = (frag_i?, frag_n?);
+        if n == 0 {
+          None
+        } else {
+          Some((i as f64 / n as f64) * 100.0)
+        }
+      })
+      .map(clamp01pct);
+
+    // If no data is retrieved, drop the line.
+    if percentage.is_none() && speed_bps.is_none() && eta_secs.is_none() {
+      return None;
+    }
+
+    Some(ProgressEvent::Progress(MediaProgress {
+      id: self.id.clone(),
+      group_id: self.group_id.clone(),
+      category: self.current_category.clone(),
+      percentage,
+      speed_bps,
+      eta_secs,
+    }))
+  }
+
+  fn try_ffmpeg_progress_update(&self, line: &str) -> Option<ProgressEvent> {
+    let total_secs = self.partial_download_duration_secs?;
+    if total_secs <= 0.0 {
+      return None;
+    }
+
+    let elapsed_secs = parse_ffmpeg_progress_time_secs(line)?;
+    if elapsed_secs < 0.0 {
+      return None;
+    }
+    let percentage = ((elapsed_secs / total_secs) * 100.0).clamp(0.0, 100.0);
+    let speed = parse_ffmpeg_speed_factor(line);
+    let eta_secs = speed.and_then(|value| {
+      if value <= 0.0 {
+        None
+      } else {
+        Some(((total_secs - elapsed_secs).max(0.0) / value).ceil() as u64)
+      }
+    });
+
+    Some(ProgressEvent::Progress(MediaProgress {
+      id: self.id.clone(),
+      group_id: self.group_id.clone(),
+      category: self.current_category.clone(),
+      percentage: Some(percentage),
+      speed_bps: None,
+      eta_secs,
+    }))
+  }
+
+  fn try_merging_stage(&mut self, line: &str) -> Option<ProgressEvent> {
+    if line.starts_with("[Merger]") && self.current_stage != ProgressStage::Merging {
+      self.current_stage = ProgressStage::Merging;
+      return Some(ProgressEvent::StageChange(MediaProgressStage {
+        id: self.id.clone(),
+        group_id: self.group_id.clone(),
+        stage: self.current_stage.clone(),
+      }));
+    }
+    None
+  }
+
+  fn try_postprocess_stage(&mut self, line: &str) -> Option<ProgressEvent> {
+    let stage = if line.starts_with("[VideoRemuxer]") {
+      ProgressStage::Remuxing
+    } else if line.starts_with("[VideoConvertor]") {
+      ProgressStage::Reencoding
+    } else {
+      return None;
+    };
+
+    if self.current_stage != stage {
+      self.current_stage = stage.clone();
+      return Some(ProgressEvent::StageChange(MediaProgressStage {
+        id: self.id.clone(),
+        group_id: self.group_id.clone(),
+        stage,
+      }));
+    }
+
+    None
+  }
+
+  fn try_finalizing_stage(&mut self, line: &str) -> Option<ProgressEvent> {
+    let triggers = ["[ffmpeg]", "[Fixup]", "Deleting original file"];
+    if triggers
+      .iter()
+      .any(|p| line.starts_with(p) || line.contains(p))
+      && self.current_stage != ProgressStage::Finalizing
+    {
+      self.current_stage = ProgressStage::Finalizing;
+      return Some(ProgressEvent::StageChange(MediaProgressStage {
+        id: self.id.clone(),
+        group_id: self.group_id.clone(),
+        stage: self.current_stage.clone(),
+      }));
+    }
+    None
+  }
+}
+
+pub fn progress_category_for_track_type(track_type: &TrackType) -> ProgressCategory {
+  match track_type {
+    TrackType::Audio => ProgressCategory::Audio,
+    TrackType::Video | TrackType::Both => ProgressCategory::Video,
+  }
+}
+
+fn parse_ffmpeg_progress_time_secs(line: &str) -> Option<f64> {
+  extract_latest_ffmpeg_progress_sample(line)
+    .and_then(|sample| extract_token_value(sample, "time="))
+    .and_then(parse_clock_to_secs)
+}
+
+fn parse_ffmpeg_speed_factor(line: &str) -> Option<f64> {
+  extract_latest_ffmpeg_progress_sample(line)
+    .and_then(|sample| extract_token_value(sample, "speed="))
+    .and_then(|speed_value| speed_value.trim_end_matches('x').trim().parse::<f64>().ok())
+}
+
+fn extract_latest_ffmpeg_progress_sample(line: &str) -> Option<&str> {
+  line
+    .split('\r')
+    .rev()
+    .map(str::trim)
+    .find(|sample| sample.contains("time=") && sample.contains("frame="))
+}
+
+fn extract_token_value<'a>(line: &'a str, token: &str) -> Option<&'a str> {
+  let start = line.find(token)? + token.len();
+  let rest = &line[start..];
+  let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+  let value = rest[..end].trim();
+  if value.is_empty() {
+    None
+  } else {
+    Some(value)
+  }
+}
+
+fn parse_clock_to_secs(value: &str) -> Option<f64> {
+  let mut total = 0.0;
+  let parts = value.trim().split(':').collect::<Vec<_>>();
+  if parts.len() != 3 {
+    return None;
+  }
+
+  for (index, part) in parts.iter().enumerate() {
+    let component = part.trim().parse::<f64>().ok()?;
+    total += component
+      * match index {
+        0 => 3600.0,
+        1 => 60.0,
+        2 => 1.0,
+        _ => unreachable!(),
+      };
+  }
+
+  Some(total)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{progress_category_for_track_type, YtdlpProgressParser};
+  use crate::models::{ProgressCategory, ProgressEvent, ProgressStage, TrackType};
+
+  #[test]
+  fn parses_ffmpeg_progress_for_partial_downloads() {
+    let parser = YtdlpProgressParser::new("item", "group", ProgressCategory::Video, Some(60.0));
+    let event = parser
+      .try_ffmpeg_progress_update(
+        "frame= 1861 fps=164 q=-1.0 size=    1433kB time=00:00:28.98 bitrate=405.1kbits/s speed=2.56x",
+      )
+      .expect("expected ffmpeg progress");
+
+    let ProgressEvent::Progress(progress) = event else {
+      panic!("expected progress event");
+    };
+
+    assert_eq!(progress.category, ProgressCategory::Video);
+    assert!(progress
+      .percentage
+      .is_some_and(|value| value > 48.0 && value < 49.0));
+    assert_eq!(progress.eta_secs, Some(13));
+    assert_eq!(progress.speed_bps, None);
+  }
+
+  #[test]
+  fn ignores_ffmpeg_progress_without_partial_duration() {
+    let parser = YtdlpProgressParser::new("item", "group", ProgressCategory::Audio, None);
+
+    assert!(parser
+      .try_ffmpeg_progress_update("frame=1 time=00:00:05.00 speed=1.0x")
+      .is_none());
+  }
+
+  #[test]
+  fn parses_fractional_clock_values() {
+    assert_eq!(super::parse_clock_to_secs("00:01:02.50"), Some(62.5));
+  }
+
+  #[test]
+  fn derives_category_from_track_type() {
+    assert_eq!(
+      progress_category_for_track_type(&TrackType::Audio),
+      ProgressCategory::Audio
+    );
+    assert_eq!(
+      progress_category_for_track_type(&TrackType::Video),
+      ProgressCategory::Video
+    );
+    assert_eq!(
+      progress_category_for_track_type(&TrackType::Both),
+      ProgressCategory::Video
+    );
+  }
+
+  #[test]
+  fn detects_reencoding_stage_from_video_convertor_logs() {
+    let mut parser = YtdlpProgressParser::new("item", "group", ProgressCategory::Video, None);
+    let events = parser.parse_line(r#"[VideoConvertor] Destination: "/tmp/out.mp4""#);
+
+    assert!(events.iter().any(|event| matches!(
+      event,
+      ProgressEvent::StageChange(stage) if stage.stage == ProgressStage::Reencoding
+    )));
+  }
+
+  #[test]
+  fn detects_remuxing_stage_from_video_remuxer_logs() {
+    let mut parser = YtdlpProgressParser::new("item", "group", ProgressCategory::Video, None);
+    let events = parser.parse_line(r#"[VideoRemuxer] Destination: "/tmp/out.mp4""#);
+
+    assert!(events.iter().any(|event| matches!(
+      event,
+      ProgressEvent::StageChange(stage) if stage.stage == ProgressStage::Remuxing
+    )));
+  }
+}

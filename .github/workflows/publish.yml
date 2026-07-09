@@ -1,0 +1,375 @@
+name: 'Publish'
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - release
+
+jobs:
+  publish-tauri:
+    permissions:
+      contents: write
+    env:
+      WINDOWS_PFX_B64: ${{ secrets.WINDOWS_PFX_B64 }}
+      WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest'
+            args: '--target aarch64-apple-darwin'
+          - platform: 'macos-latest'
+            args: '--target x86_64-apple-darwin'
+          - platform: 'ubuntu-24.04'
+            args: ''
+          - platform: 'ubuntu-24.04-arm'
+            args: ''
+          - platform: 'windows-latest'
+            args: ''
+          - platform: 'windows-11-arm'
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: install dependencies (ubuntu only)
+        if: matrix.platform == 'ubuntu-24.04' || matrix.platform == 'ubuntu-24.04-arm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: install Rust 1.94.1
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # rust-toolchain action
+        with:
+          toolchain: 1.94.1
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.platform == 'windows-11-arm' && 'aarch64-pc-windows-msvc' || '' }}
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@0fde6d128a3d980ceac30be8c8b8739abd963b81 # v2
+        with:
+          tool: cargo-about
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Import Apple Developer Certificate (MacOS only)
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo $APPLE_CERTIFICATE | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain
+
+      - name: Prepare notarization key (macOS only)
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+        run: |
+          mkdir -p "$(dirname "$APPLE_API_KEY_PATH")"
+          printf '%s' "$APPLE_API_KEY_P8" > "$APPLE_API_KEY_PATH"
+
+      - name: Setup Sentry CLI
+        if: matrix.platform != 'windows-11-arm'
+        uses: matbour/setup-sentry-cli@ac9d752ca8f44ef545fb2ce2dcd329cce57d778b # v2
+        with:
+          version: 2.58.2
+          token: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          organization: ${{ secrets.SENTRY_ORG }}
+          project: ${{ secrets.SENTRY_PROJECT }}
+
+      # TEMPORARY WORKAROUND:
+      # Use a custom tauri-cli branch to enable the new "truly portable" AppImage format.
+      # This relies on TAURI_BUNDLER_NEW_APPIMAGE_FORMAT=true and can be removed once
+      # https://github.com/tauri-apps/tauri/pull/12491 is merged and released upstream.
+      #
+      # Pin to the last revision before the quick-sharun migration, which started
+      # delegating bundling to a mutable external script downloaded at build time.
+      - name: Override tauri-cli (ubuntu only)
+        if: matrix.platform == 'ubuntu-24.04' || matrix.platform == 'ubuntu-24.04-arm'
+        shell: bash
+        run: |
+          cargo install tauri-cli --git https://github.com/tauri-apps/tauri --rev b5573c1db2bb6118594b586a6aa51aeb37aa7d84 --locked --force
+          echo "TAURI_BUNDLER_NEW_APPIMAGE_FORMAT=true" >> $GITHUB_ENV
+
+      # TEMPORARY WORKAROUND:
+      # Because we use "cargo tauri" in that tauri build step, we always have to install tauri cli here.
+      - name: Install tauri-cli
+        if: matrix.platform != 'ubuntu-24.04' && matrix.platform != 'ubuntu-24.04-arm'
+        shell: bash
+        run: |
+          cargo install tauri-cli
+
+      - uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+          # TEMPORARY WORKAROUND:
+          # This environment variable is needed to enable the new appimage features.
+          TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: "true"
+        with:
+          tagName: app-v__VERSION__
+          releaseName: 'Open Video Downloader v__VERSION__'
+          releaseBody: 'See the assets to download this version and install. If you have an existing install, it will auto-update on launch.'
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          # TEMPORARY WORKAROUND:
+          # This option is needed to use the possibly overriden branch of tauri-cli, to fix appimages.
+          tauriScript: 'cargo tauri'
+          args: ${{ matrix.args }}
+
+      - name: Create public PDBs (Windows only)
+        if: matrix.platform == 'windows-latest' || matrix.platform == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $kitsRoot = "${Env:ProgramFiles(x86)}\Windows Kits\10"
+          if (-not (Test-Path $kitsRoot)) {
+            Write-Error "Windows 10 Kits folder not found at $kitsRoot"
+          }
+
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $pdbcopy = Get-ChildItem -Path $kitsRoot -Recurse -Filter "pdbcopy.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\$arch\\pdbcopy\.exe$" } |
+            Select-Object -First 1
+
+          if (-not $pdbcopy -and $env:RUNNER_ARCH -eq 'ARM64') {
+            $pdbcopy = Get-ChildItem -Path $kitsRoot -Recurse -Filter "pdbcopy.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "\\x64\\pdbcopy\.exe$" } |
+              Select-Object -First 1
+          }
+
+          if (-not $pdbcopy) {
+            Write-Error "pdbcopy.exe not found under $kitsRoot"
+          }
+
+          $pdbs = Get-ChildItem -Path "src-tauri/target/release" -Filter "*.pdb"
+          if (-not $pdbs) {
+            Write-Error "No PDB files found under src-tauri/target/release"
+          }
+
+          $publicDir = "src-tauri/target/release/public-pdb"
+          New-Item -ItemType Directory -Path $publicDir -Force | Out-Null
+
+          foreach ($pdb in $pdbs) {
+            $outPath = Join-Path $publicDir $pdb.Name
+            & "$($pdbcopy.FullName)" "$($pdb.FullName)" "$outPath" -p
+          }
+
+      - name: Upload debug symbols to Sentry
+        if: matrix.platform != 'windows-11-arm'
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: |
+          VERSION="$(node -p 'require("./package.json").version')"
+          SENTRY_RELEASE="ovd@${VERSION}"
+          export SENTRY_RELEASE
+          
+          echo "Using Sentry release: $SENTRY_RELEASE"
+          
+          cd src-tauri
+          
+          if [ -d "target/release/public-pdb" ]; then
+            sentry-cli debug-files upload --include-sources target/release/public-pdb
+          else
+            sentry-cli debug-files upload --include-sources target/release
+          fi
+          
+          if [ "${{ matrix.platform }}" = "ubuntu-24.04" ]; then
+            sentry-cli releases new "$SENTRY_RELEASE" || true
+            sentry-cli releases set-commits "$SENTRY_RELEASE" --auto || true
+            sentry-cli releases finalize "$SENTRY_RELEASE" || true
+          fi
+
+      - name: Fetch tool binaries for MSIX (Windows only)
+        if: matrix.platform == 'windows-latest' || matrix.platform == 'windows-11-arm'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run manifest:fetch
+
+      - name: Bundle Portable Version (Windows only)
+        if: matrix.platform == 'windows-latest' || matrix.platform == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $releaseDir = "src-tauri/target/release"
+          $layoutRoot = "portable-layout"
+          $portableFolder = "ovd-portable"
+
+          $pkg = Get-Content -Raw "package.json" | ConvertFrom-Json
+          $version = $pkg.version
+          
+          # Detect architecture
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          
+          $zipName = "Open.Video.Downloader_$($version)_$($arch)-portable.zip"
+          $exeName = "Open.Video.Downloader_$($version)_$($arch).exe"
+          $keepFileName = ".keep"
+          
+          $tagName = "app-v$version"
+          Write-Host "Building portable bundle for $arch architecture: $zipName"
+          Write-Host "Using release tag: $tagName"
+          
+          $exe = Get-ChildItem -Path $releaseDir -Filter "*.exe" | Where-Object { $_.Name -notmatch "setup" } | Select-Object -First 1
+          if (-not $exe) { Write-Error "Could not find main exe in $releaseDir" }
+          
+          New-Item -ItemType Directory -Path "$layoutRoot/$portableFolder" -Force | Out-Null
+          New-Item -ItemType File -Path "$layoutRoot/$portableFolder/$keepFileName" -Value "Do not remove this file or directory." -Force | Out-Null
+          Copy-Item $exe.FullName -Destination "$layoutRoot/$exeName" -Force
+          
+          Compress-Archive -Path "$layoutRoot/*" -DestinationPath $zipName -Force
+      
+          echo "PORTABLE_ASSET=$zipName" >> $env:GITHUB_ENV
+          echo "RELEASE_TAG=$tagName" >> $env:GITHUB_ENV
+
+      - name: Upload Portable (Windows only)
+        if: matrix.platform == 'windows-latest' || matrix.platform == 'windows-11-arm'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Uploading ${PORTABLE_ASSET} to release ${RELEASE_TAG}"
+          gh release upload "${RELEASE_TAG}" "${PORTABLE_ASSET}" --clobber
+
+      - name: Install VC++ runtime (Windows ARM64 only)
+        if: matrix.platform == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "vc_redist.arm64.exe"
+          Invoke-WebRequest -Uri "https://aka.ms/vc14/vc_redist.arm64.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/install","/quiet","/norestart" -Wait
+
+      - name: Build and sign MSIX (Windows only)
+        if: matrix.platform == 'windows-latest' || matrix.platform == 'windows-11-arm'
+        uses: ./.github/actions/msix-build-sign
+        with:
+          pfx-b64: ${{ secrets.WINDOWS_PFX_B64 }}
+          pfx-password: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+
+      - name: Upload MSIX artifact (Windows only)
+        if: matrix.platform == 'windows-latest' || matrix.platform == 'windows-11-arm'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ovd-msix-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+          path: OpenVideoDownloader_${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}.msix
+
+      - name: Upload PDB symbols (Windows only)
+        if: matrix.platform == 'windows-latest' || matrix.platform == 'windows-11-arm'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ovd-pdb-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+          path: src-tauri/target/release/public-pdb/*.pdb
+
+  package-appxupload:
+    runs-on: windows-latest
+    needs: publish-tauri
+    steps:
+      - name: Download x64 MSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ovd-msix-x64
+          path: dist/msix/x64
+
+      - name: Download arm64 MSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ovd-msix-arm64
+          path: dist/msix/arm64
+
+      - name: Download x64 PDB symbols
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ovd-pdb-x64
+          path: dist/symbols/x64
+
+      - name: Download arm64 PDB symbols
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ovd-pdb-arm64
+          path: dist/symbols/arm64
+
+      - name: Create msixupload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+  
+          $makeappx = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "MakeAppx.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1 | ForEach-Object FullName
+          if (-not $makeappx) { throw "MakeAppx.exe not found (Windows SDK missing?)" }
+  
+          $x64 = Get-ChildItem "dist/msix/x64"   -Filter "*.msix" | Select-Object -First 1
+          $arm64 = Get-ChildItem "dist/msix/arm64" -Filter "*.msix" | Select-Object -First 1
+          if (-not $x64)   { throw "Missing x64 .msix under dist/msix/x64" }
+          if (-not $arm64) { throw "Missing arm64 .msix under dist/msix/arm64" }
+  
+          if (Test-Path "unpack_tmp") { Remove-Item "unpack_tmp" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "unpack_tmp" | Out-Null
+          & $makeappx unpack /p $x64.FullName /d "unpack_tmp" | Out-Null
+          [xml]$xml = Get-Content "unpack_tmp\AppxManifest.xml"
+          $version = $xml.Package.Identity.Version
+          if (-not $version) { throw "Failed to read Identity.Version from x64 manifest" }
+  
+          $pdbs = Get-ChildItem -Path "dist/symbols" -Filter "*.pdb" -Recurse
+          if (-not $pdbs) { throw "No PDB files found under dist/symbols" }
+          Compress-Archive -Path $pdbs.FullName -DestinationPath "OpenVideoDownloader.appxsym" -Force
+  
+          if (Test-Path "bundle_in") { Remove-Item "bundle_in" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "bundle_in" | Out-Null
+          Copy-Item $x64.FullName "bundle_in\OpenVideoDownloader_x64.msix" -Force
+          Copy-Item $arm64.FullName "bundle_in\OpenVideoDownloader_arm64.msix" -Force
+  
+          & $makeappx bundle /d "bundle_in" /p "OpenVideoDownloader.msixbundle" /bv $version | Out-Null
+  
+          if (Test-Path "upload") { Remove-Item "upload" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "upload" | Out-Null
+          Copy-Item "OpenVideoDownloader.msixbundle" "upload\" -Force
+          Copy-Item "OpenVideoDownloader.appxsym" "upload\" -Force
+  
+          Compress-Archive -Path "upload\*" -DestinationPath "OpenVideoDownloader.msixupload" -Force
+
+      - name: Upload msixupload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ovd-msixupload
+          path: OpenVideoDownloader.msixupload

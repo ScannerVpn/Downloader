@@ -1,0 +1,135 @@
+name: CI Vue
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/vue-ci.yml'
+      - 'public/**'
+      - 'src/**'
+      - 'src-isolation/**'
+      - 'tests/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vitest.*'
+      - '*.config.*'
+      - 'tsconfig.*'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/vue-ci.yml'
+      - 'public/**'
+      - 'src/**'
+      - 'src-isolation/**'
+      - 'tests/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vitest.*'
+      - '*.config.*'
+      - 'tsconfig.*'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: 'Lint'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies & run lint
+        run: |
+          npm ci
+          npm run lint
+
+  unit-tests:
+    name: 'Unit Tests'
+    runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies & run unit tests
+        run: |
+          npm ci
+          npm run test:unit
+
+      - name: Upload unit coverage to Codecov
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: coverage/units/lcov.info
+          flags: unit
+          token: ${{ env.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+
+  e2e-tests:
+    name: 'E2E Tests'
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.60.0-noble
+      options: --ipc=host --shm-size=1g
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: npm ci
+
+      - name: Run end-to-end tests with coverage
+        run: npm run test:e2e
+
+      - name: Upload e2e coverage to Codecov
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: coverage/e2e/lcov.info
+          flags: e2e
+          token: ${{ env.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+
+  build:
+    name: 'Build'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies & build
+        run: |
+          npm ci
+          npm run build

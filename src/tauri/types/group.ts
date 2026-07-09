@@ -1,0 +1,38 @@
+import { Chapter, EntryItem, MediaCodec, MediaFormat, MediaItem, MediaTrack } from './media';
+
+export type Group = {
+  id: string;
+  total: number;
+  processed: number;
+  errored: number;
+  isCombined: boolean;
+  items: Record<string, MediaItem>;
+  url: string;
+  title?: string;
+  thumbnail?: string;
+  description?: string;
+  uploaderId?: string;
+  uploader?: string;
+  extractor?: string;
+  views?: number;
+  comments?: number;
+  likes?: number;
+  dislikes?: number;
+  rating?: number;
+  duration?: number;
+  audioCodecs: MediaCodec[];
+  videoCodecs?: MediaCodec[];
+  audioTracks?: MediaTrack[];
+  videoTracks?: MediaTrack[];
+  formats: MediaFormat[];
+  chapters?: Chapter[];
+  entries?: EntryItem[];
+  filesize: number;
+  playlistId?: string;
+  playlistTitle?: string;
+  playlistCount?: number;
+  playlistUploader?: string;
+  playlistUploaderId?: string;
+  fromShortcut?: boolean;
+  skipPlaylistSelection?: boolean;
+};

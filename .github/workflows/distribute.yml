@@ -1,0 +1,57 @@
+name: 'Distribute'
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  distribute-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout release branch for current package.json
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: release
+      - name: Update winget manifest
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          set-strictmode -version latest
+          $ErrorActionPreference = "Stop"
+
+          $pkg = Get-Content -Raw "package.json" | ConvertFrom-Json
+          $version = $pkg.version
+
+          $tag = "app-v$version"
+          $installerUrlX64 = "https://github.com/jely2002/youtube-dl-gui/releases/download/$tag/Open.Video.Downloader_${version}_x64-setup.exe"
+          $installerUrlArm64 = "https://github.com/jely2002/youtube-dl-gui/releases/download/$tag/Open.Video.Downloader_${version}_arm64-setup.exe"
+          Write-Host "Updating winget manifest for version $version"
+          Write-Host "Installer URL (x64): $installerUrlX64"
+          Write-Host "Installer URL (ARM64): $installerUrlArm64"
+
+          Invoke-WebRequest `
+            -Uri https://aka.ms/wingetcreate/latest `
+            -OutFile wingetcreate.exe
+
+          ./wingetcreate.exe update `
+            jely2002.youtube-dl-gui `
+            --version $version `
+            --urls $installerUrlX64 $installerUrlArm64 `
+            --submit `
+            --token $env:WINGET_TOKEN
+
+  distribute-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install snapcraft
+        run: sudo snap install snapcraft --classic
+      - name: Promote edge to stable
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+          snapcraft whoami
+          snapcraft promote open-video-downloader --from-channel=edge --to-channel=stable --yes

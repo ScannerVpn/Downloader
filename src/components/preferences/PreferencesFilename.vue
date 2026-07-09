@@ -1,0 +1,207 @@
+<template>
+  <base-fieldset
+      :legend="t('location.filename.legend')"
+      :label="t('location.filename.legendLabel')"
+  >
+    <base-tabbed-pane
+        v-model="activeTab"
+        :tabs="tabs"
+        id-prefix="filename"
+    >
+      <template #video>
+        <format-preset-selector
+            id-prefix="video"
+            :presets="videoFormatPresets"
+            v-model="videoTemplate"
+            v-model:preset="selectedVideoFormatPreset"
+            v-model:restrict-filenames="restrictFilenames"
+            :track-type="TrackType.video"
+            :preset-label="t('location.filename.formatPreset.label')"
+            :format-label="t('location.filename.outputFormat.label')"
+            :example-label="t('location.filename.formatPreset.exampleLabel')"
+            :restrict-filenames-label="t('location.filename.formatPreset.restrictFilenames.label')"
+            :restrict-filenames-hint="t('location.filename.formatPreset.restrictFilenames.hint')"
+        >
+          <template #before-example>
+            <div class="mb-4 flex flex-col gap-1">
+              <label class="font-semibold" for="video-reverse-playlist-numbering">
+                {{ t('location.filename.reversePlaylistNumbering.label') }}
+              </label>
+              <input
+                  id="video-reverse-playlist-numbering"
+                  v-model="reversePlaylistNumbering"
+                  type="checkbox"
+                  class="toggle toggle-primary my-1"
+              />
+              <p class="label">
+                {{ t('location.filename.reversePlaylistNumbering.hint') }}
+              </p>
+            </div>
+          </template>
+        </format-preset-selector>
+      </template>
+
+      <template #audio>
+        <format-preset-selector
+            id-prefix="audio"
+            :presets="audioFormatPresets"
+            v-model="audioTemplate"
+            v-model:preset="selectedAudioFormatPreset"
+            v-model:restrict-filenames="restrictFilenames"
+            :track-type="TrackType.audio"
+            :preset-label="t('location.filename.formatPreset.label')"
+            :format-label="t('location.filename.outputFormat.label')"
+            :example-label="t('location.filename.formatPreset.exampleLabel')"
+            :restrict-filenames-label="t('location.filename.formatPreset.restrictFilenames.label')"
+            :restrict-filenames-hint="t('location.filename.formatPreset.restrictFilenames.hint')"
+        >
+          <template #before-example>
+            <div class="mb-4 flex flex-col gap-1">
+              <label class="font-semibold" for="audio-reverse-playlist-numbering">
+                {{ t('location.filename.reversePlaylistNumbering.label') }}
+              </label>
+              <input
+                  id="audio-reverse-playlist-numbering"
+                  v-model="reversePlaylistNumbering"
+                  type="checkbox"
+                  class="toggle toggle-primary my-1"
+              />
+              <p class="label">
+                {{ t('location.filename.reversePlaylistNumbering.hint') }}
+              </p>
+            </div>
+          </template>
+        </format-preset-selector>
+      </template>
+    </base-tabbed-pane>
+  </base-fieldset>
+</template>
+
+<script setup lang="ts">
+import BaseFieldset from '../base/BaseFieldset.vue';
+import BaseTabbedPane from '../base/BaseTabbedPane.vue';
+import FormatPresetSelector from './FormatPresetSelector.vue';
+import { FormatPreset, Settings } from '../../tauri/types/config';
+import { useI18n } from 'vue-i18n';
+import { computed, onMounted, ref } from 'vue';
+import { TrackType } from '../../tauri/types/media';
+
+interface TabDef {
+  id: string;
+  label: string;
+}
+
+interface PresetDef {
+  label: string;
+  value: FormatPreset;
+  format: string;
+  example?: string;
+}
+
+const { t } = useI18n();
+const settings = defineModel<Settings>({ required: true });
+
+const activeTab = ref<'video' | 'audio'>('video');
+
+const tabs: TabDef[] = [
+  { id: 'video', label: t('settings.output.tabs.video.label') },
+  { id: 'audio', label: t('settings.output.tabs.audio.label') },
+];
+
+const videoFormatPresets: PresetDef[] = [
+  {
+    label: t('location.filename.formatPreset.options.titleQuality'),
+    example: t('location.filename.formatPreset.examples.video.titleQuality'),
+    value: FormatPreset.TitleQuality,
+    format: '%(title).200s-(%(height)sp%(fps).0d).%(ext)s',
+  },
+  {
+    label: t('location.filename.formatPreset.options.titleOnly'),
+    example: t('location.filename.formatPreset.examples.video.titleOnly'),
+    value: FormatPreset.TitleOnly,
+    format: '%(title).200s.%(ext)s',
+  },
+  {
+    label: t('location.filename.formatPreset.options.titleQualityPlaylist'),
+    example: t('location.filename.formatPreset.examples.video.titleQualityPlaylist'),
+    value: FormatPreset.TitleQualityPlaylist,
+    format: '%(playlist_index)02d-%(title).200s-(%(height)sp%(fps).0d).%(ext)s',
+  },
+  {
+    label: t('location.filename.formatPreset.options.custom'),
+    value: FormatPreset.Custom,
+    format: '',
+  },
+];
+
+const audioFormatPresets: PresetDef[] = [
+  {
+    label: t('location.filename.formatPreset.options.titleQuality'),
+    example: t('location.filename.formatPreset.examples.audio.titleQuality'),
+    value: FormatPreset.TitleQuality,
+    format: '%(title).200s-(%(abr)dk).%(ext)s',
+  },
+  {
+    label: t('location.filename.formatPreset.options.titleOnly'),
+    example: t('location.filename.formatPreset.examples.audio.titleOnly'),
+    value: FormatPreset.TitleOnly,
+    format: '%(title).200s.%(ext)s',
+  },
+  {
+    label: t('location.filename.formatPreset.options.titleQualityPlaylist'),
+    example: t('location.filename.formatPreset.examples.audio.titleQualityPlaylist'),
+    value: FormatPreset.TitleQualityPlaylist,
+    format: '%(playlist_index)02d-%(title).200s-(%(abr)dk).%(ext)s',
+  },
+  {
+    label: t('location.filename.formatPreset.options.custom'),
+    value: FormatPreset.Custom,
+    format: '',
+  },
+];
+
+const selectedVideoFormatPreset = ref<FormatPreset>(FormatPreset.Custom);
+const selectedAudioFormatPreset = ref<FormatPreset>(FormatPreset.Custom);
+
+const videoTemplate = computed<string>({
+  get: () => settings.value.output.fileNameTemplate ?? '',
+  set(val) {
+    settings.value.output.fileNameTemplate = val;
+  },
+});
+
+const audioTemplate = computed<string>({
+  get: () => settings.value.output.audioFileNameTemplate ?? '',
+  set(val) {
+    settings.value.output.audioFileNameTemplate = val;
+  },
+});
+
+const restrictFilenames = computed<boolean>({
+  get: () => settings.value.output.restrictFilenames ?? false,
+  set(val) {
+    settings.value.output.restrictFilenames = val;
+  },
+});
+
+const reversePlaylistNumbering = computed<boolean>({
+  get: () => settings.value.output.reversePlaylistNumbering ?? false,
+  set(val) {
+    settings.value.output.reversePlaylistNumbering = val;
+  },
+});
+
+onMounted(() => {
+  const videoMatch = videoFormatPresets.find(
+    p => p.value !== FormatPreset.Custom
+      && settings.value.output.fileNameTemplate === p.format,
+  );
+  selectedVideoFormatPreset.value = videoMatch?.value ?? FormatPreset.Custom;
+
+  const audioMatch = audioFormatPresets.find(
+    p => p.value !== FormatPreset.Custom
+      && settings.value.output.audioFileNameTemplate === p.format,
+  );
+  selectedAudioFormatPreset.value = audioMatch?.value ?? FormatPreset.Custom;
+});
+</script>
