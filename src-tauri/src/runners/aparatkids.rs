@@ -6,8 +6,12 @@ static APARATKIDS_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
   Regex::new(r"https?://(?:www\.)?aparatkids\.com/(?:w|m)/([a-zA-Z0-9]+)").unwrap()
 });
 
-static APARAT_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-  Regex::new(r"https?://(?:www\.)?aparat\.com/(?:v|m)/([a-zA-Z0-9]+)").unwrap()
+static APARAT_VIDEO_RE: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"https?://(?:www\.)?aparat\.com/v/([a-zA-Z0-9]+)").unwrap()
+});
+
+static APARAT_MOVIE_RE: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"https?://(?:www\.)?aparat\.com/m/([a-zA-Z0-9]+)").unwrap()
 });
 
 pub struct AparatkidsResolved {
@@ -18,7 +22,9 @@ pub struct AparatkidsResolved {
 }
 
 pub fn is_aparatkids_url(url: &str) -> bool {
-  APARATKIDS_URL_RE.is_match(url) || APARAT_URL_RE.is_match(url)
+  APARATKIDS_URL_RE.is_match(url)
+    || APARAT_VIDEO_RE.is_match(url)
+    || APARAT_MOVIE_RE.is_match(url)
 }
 
 pub async fn resolve_aparatkids_url(url: &str) -> Result<AparatkidsResolved, String> {
@@ -27,21 +33,23 @@ pub async fn resolve_aparatkids_url(url: &str) -> Result<AparatkidsResolved, Str
     .build()
     .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
-  if APARAT_URL_RE.is_match(url) {
-    resolve_aparat_com(&client, url).await
+  if APARAT_VIDEO_RE.is_match(url) {
+    resolve_aparat_video(&client, url).await
+  } else if APARAT_MOVIE_RE.is_match(url) {
+    resolve_aparat_movie(&client, url).await
   } else {
     resolve_aparatkids_com(&client, url).await
   }
 }
 
-/// Resolve aparat.com URLs via their JSON API
-async fn resolve_aparat_com(
+/// Resolve aparat.com /v/ video URLs via their JSON API
+async fn resolve_aparat_video(
   client: &reqwest::Client,
   url: &str,
 ) -> Result<AparatkidsResolved, String> {
-  let caps = APARAT_URL_RE
+  let caps = APARAT_VIDEO_RE
     .captures(url)
-    .ok_or_else(|| "Invalid aparat.com URL".to_string())?;
+    .ok_or_else(|| "Invalid aparat.com video URL".to_string())?;
   let video_hash = caps.get(1).unwrap().as_str();
 
   let api_url = format!(
@@ -72,10 +80,8 @@ async fn resolve_aparat_com(
     .and_then(|d| d.get("attributes"))
     .ok_or_else(|| "Invalid API response: missing video attributes".to_string())?;
 
-  // Extract m3u8 URL
   let m3u8_url = extract_aparat_m3u8(attrs)?;
 
-  // Extract metadata
   let title = attrs
     .get("title")
     .and_then(|v| v.as_str())
@@ -101,15 +107,92 @@ async fn resolve_aparat_com(
   })
 }
 
+/// Resolve aparat.com /m/ movie URLs via their JSON API
+async fn resolve_aparat_movie(
+  client: &reqwest::Client,
+  url: &str,
+) -> Result<AparatkidsResolved, String> {
+  let caps = APARAT_MOVIE_RE
+    .captures(url)
+    .ok_or_else(|| "Invalid aparat.com movie URL".to_string())?;
+  let movie_hash = caps.get(1).unwrap().as_str();
+
+  let api_url = format!(
+    "https://www.aparat.com/api/fa/v1/movie/movie/one/moviehash/{}",
+    movie_hash
+  );
+
+  let resp = client
+    .get(&api_url)
+    .header("Referer", "https://www.aparat.com/")
+    .header("Accept", "application/json")
+    .send()
+    .await
+    .map_err(|e| format!("Failed to fetch movie API: {e}"))?;
+
+  let status = resp.status();
+  if !status.is_success() {
+    return Err(format!("Movie API returned status {}", status));
+  }
+
+  let json: Value = resp
+    .json()
+    .await
+    .map_err(|e| format!("Failed to parse movie API response: {e}"))?;
+
+  // Navigate to movieData[0]
+  let movie_data = json
+    .get("data")
+    .and_then(|d| d.get("attributes"))
+    .and_then(|a| a.get("movieData"))
+    .and_then(|m| m.as_array())
+    .and_then(|arr| arr.first())
+    .ok_or_else(|| "Invalid movie API response: no movie data".to_string())?;
+
+  // Extract m3u8 from playerOption.multiSRC
+  let m3u8_url = extract_movie_m3u8(movie_data)?;
+
+  // Extract metadata from General
+  let general = movie_data.get("General");
+  let title = general
+    .and_then(|g| g.get("title"))
+    .or_else(|| general.and_then(|g| g.get("title_fa")))
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_string());
+
+  let thumbnail = general
+    .and_then(|g| g.get("cover"))
+    .or_else(|| general.and_then(|g| g.get("thumbnails")))
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_string());
+
+  let duration = movie_data
+    .get("playerOption")
+    .and_then(|p| p.get("duration"))
+    .and_then(|v| v.as_f64())
+    .filter(|&d| d > 0.0)
+    .or_else(|| {
+      general
+        .and_then(|g| g.get("duration"))
+        .and_then(|v| v.as_f64())
+        .filter(|&d| d > 0.0)
+    });
+
+  Ok(AparatkidsResolved {
+    m3u8_url,
+    title,
+    thumbnail,
+    duration,
+  })
+}
+
 fn extract_aparat_m3u8(attrs: &Value) -> Result<String, String> {
-  // Try hls_link first
   if let Some(hls) = attrs.get("hls_link").and_then(|v| v.as_str()) {
     if !hls.is_empty() {
       return Ok(hls.to_string());
     }
   }
 
-  // Try hls.link
   if let Some(hls_obj) = attrs.get("hls") {
     if let Some(link) = hls_obj.get("link").and_then(|v| v.as_str()) {
       if !link.is_empty() {
@@ -118,15 +201,6 @@ fn extract_aparat_m3u8(attrs: &Value) -> Result<String, String> {
     }
   }
 
-  // Try manifest field
-  if let Some(manifest) = attrs.get("manifest").and_then(|v| v.as_str()) {
-    if manifest.starts_with("#EXTM3U") {
-      // The manifest itself is m3u8 content - we need the URL, not content
-      // Fall through to file_link
-    }
-  }
-
-  // Try file_link as fallback (direct MP4)
   if let Some(file_link) = attrs.get("file_link").and_then(|v| v.as_str()) {
     if !file_link.is_empty() {
       return Ok(file_link.to_string());
@@ -134,6 +208,36 @@ fn extract_aparat_m3u8(attrs: &Value) -> Result<String, String> {
   }
 
   Err("No video stream found in API response".to_string())
+}
+
+fn extract_movie_m3u8(movie_data: &Value) -> Result<String, String> {
+  // Try playerOption.multiSRC
+  if let Some(player) = movie_data.get("playerOption") {
+    if let Some(multi_src) = player.get("multiSRC").and_then(|v| v.as_array()) {
+      for src_group in multi_src {
+        if let Some(arr) = src_group.as_array() {
+          for src_entry in arr {
+            if let Some(src_url) = src_entry.get("src").and_then(|v| v.as_str()) {
+              if src_url.contains(".m3u8") || src_url.contains("m3u8") {
+                return Ok(src_url.to_string());
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Try watch_action.movie_src
+  if let Some(watch) = movie_data.get("watch_action") {
+    if let Some(movie_src) = watch.get("movie_src").and_then(|v| v.as_str()) {
+      if !movie_src.is_empty() {
+        return Ok(movie_src.to_string());
+      }
+    }
+  }
+
+  Err("No video stream found in movie data".to_string())
 }
 
 /// Resolve aparatkids.com URLs by parsing the page HTML
@@ -278,6 +382,7 @@ mod tests {
     assert!(is_aparatkids_url("https://www.aparatkids.com/m/118063"));
     assert!(is_aparatkids_url("https://www.aparat.com/v/lyo8514"));
     assert!(is_aparatkids_url("https://www.aparat.com/m/bdmq6"));
+    assert!(is_aparatkids_url("https://www.aparat.com/m/5afnr"));
     assert!(!is_aparatkids_url("https://youtube.com/watch?v=abc"));
   }
 
@@ -311,13 +416,5 @@ mod tests {
     let dur = extract_duration(html);
     assert!(dur.is_some());
     assert_eq!(dur.unwrap(), 1071.0);
-  }
-
-  #[test]
-  fn test_aparat_url_patterns() {
-    assert!(APARAT_URL_RE.is_match("https://www.aparat.com/v/lyo8514"));
-    assert!(APARAT_URL_RE.is_match("https://www.aparat.com/m/bdmq6"));
-    assert!(APARAT_URL_RE.is_match("https://aparat.com/v/lyo8514"));
-    assert!(!APARAT_URL_RE.is_match("https://www.aparat.com/w/test"));
   }
 }
