@@ -1,0 +1,7 @@
+{
+  "bot_token": "",
+  "admin_id": 0,
+  "premium_users": [],
+  "daily_limit": 5,
+  "max_file_size_mb": 50
+}

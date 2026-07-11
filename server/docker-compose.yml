@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    container_name: aparatkids-bot
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json
+      - ./downloads:/app/downloads
+      - ./usage.json:/app/usage.json
