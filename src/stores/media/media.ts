@@ -133,7 +133,7 @@ export const useMediaStore = defineStore('media', () => {
     }
 
     group.total = total;
-    if (!isFirst || total > 1) group.processed++;
+    if (!isFirst) group.processed++;
 
     if (group.processed === total) {
       finalizePlaylistGroup(group);

@@ -195,11 +195,35 @@ async fn handle_fetch_entry(
             .collect();
           let total = entries.len();
           tracing::info!(playlist_id = %playlist_id, count = total, "Fetched aparat playlist entries");
-          let _ = tx.send(DispatchRequest::Pipeline(FetchRequest::Playlist {
-            group_id,
+
+          // Emit a playlist media_add event so the frontend shows playlist selection UI
+          let playlist = crate::models::ParsedPlaylist {
+            id: id.clone(),
+            url: Some(url.clone()),
+            title: None,
+            thumbnail: None,
+            uploader: None,
+            uploader_id: None,
             entries,
-            overrides: Box::new(overrides),
-          }));
+            playlist_id: Some(playlist_id.clone()),
+            playlist_count: Some(total as u64),
+          };
+
+          let payload = MediaAddPayload {
+            group_id: group_id.clone(),
+            total,
+            item: playlist,
+          };
+          let _ = app.emit("media_add", payload);
+
+          let mut counters = GROUP_COUNTERS.lock().unwrap();
+          if let Some(cnt) = counters.get_mut(&group_id) {
+            *cnt = 0;
+            counters.remove(&group_id);
+            let _ = tx.send(DispatchRequest::Cleanup {
+              group_id: group_id.clone(),
+            });
+          }
           return;
         }
         Ok(Err(e)) => {
