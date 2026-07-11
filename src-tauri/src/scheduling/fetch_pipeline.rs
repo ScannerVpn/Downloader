@@ -276,6 +276,64 @@ async fn handle_fetch_entry(
     .map(|m| m.m3u8_url.clone())
     .unwrap_or_else(|| url.clone());
 
+  // For AparatKids URLs, build metadata directly from API — skip yt-dlp entirely
+  // to avoid hanging on m3u8 stream URLs
+  if let Some(ref meta) = aparatkids_meta {
+    let single = crate::models::ParsedSingleVideo {
+      id: id.clone(),
+      url: Some(url.clone()),
+      title: meta.title.clone(),
+      thumbnail: meta.thumbnail.clone(),
+      description: None,
+      uploader_id: None,
+      uploader: None,
+      views: None,
+      comments: None,
+      likes: None,
+      dislikes: None,
+      duration: meta.duration,
+      rating: None,
+      extractor: Some("aparatkids".to_string()),
+      video_codecs: vec![],
+      audio_codecs: vec![],
+      video_tracks: vec![],
+      audio_tracks: vec![],
+      formats: vec![],
+      subtitle_inventory: crate::models::SubtitleInventory::default(),
+      chapters: vec![],
+      filesize: meta.filesize,
+    };
+
+    if let Some(fmt) = format {
+      let payload = MediaAddWithFormatPayload {
+        group_id: group_id.clone(),
+        total,
+        item: single,
+        format: fmt,
+      };
+      let _ = app.emit("media_size", payload);
+    } else {
+      let payload = MediaAddPayload {
+        group_id: group_id.clone(),
+        total,
+        item: single,
+      };
+      let _ = app.emit("media_add", payload);
+    }
+
+    let mut counters = GROUP_COUNTERS.lock().unwrap();
+    if let Some(cnt) = counters.get_mut(&group_id) {
+      *cnt -= 1;
+      if *cnt == 0 {
+        counters.remove(&group_id);
+        let _ = tx.send(DispatchRequest::Cleanup {
+          group_id: group_id.clone(),
+        });
+      }
+    }
+    return;
+  }
+
   let result = run_ytdlp_info_fetch(
     &app,
     id.clone(),
