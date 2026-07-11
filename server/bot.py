@@ -63,7 +63,11 @@ ALLOWED_DOMAINS = [
 
 def load_config():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    cfg.setdefault("daily_limit", 5)
+    cfg.setdefault("max_file_size_mb", 2048)
+    cfg.setdefault("premium_users", [])
+    return cfg
 
 
 def save_config(cfg):
@@ -741,20 +745,21 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
         caption += f"\n📦 {size}"
 
         try:
+            await status_msg.edit_text(f"📤 در حال آپلود ({file_size_mb:.0f} MB)...")
             with open(file_path, "rb") as f:
-                if file_size_mb <= 50:
+                if file_size_mb <= 2000:
                     await message.reply_video(
                         video=f,
                         caption=caption,
-                        read_timeout=300,
-                        write_timeout=300,
+                        read_timeout=600,
+                        write_timeout=600,
                     )
                 else:
                     await message.reply_document(
                         document=f,
                         caption=caption,
-                        read_timeout=300,
-                        write_timeout=300,
+                        read_timeout=600,
+                        write_timeout=600,
                     )
             await status_msg.delete()
             increment_user_usage(user_id)
@@ -839,20 +844,31 @@ async def download_playlist(query, entries, format_id, context):
                     caption += f"\n⏱ {duration}"
                 caption += f"\n📦 {size}"
 
+                # Update status to show upload
+                try:
+                    await query.edit_message_text(
+                        f"📤 آپلود {i + 1}/{total} — {vtitle[:40]}\n"
+                        f"{progress_bar} {progress_pct}%\n"
+                        f"📦 {size}",
+                        reply_markup=cancel_keyboard,
+                    )
+                except Exception:
+                    pass
+
                 with open(file_path, "rb") as f:
-                    if file_size_mb <= 50:
+                    if file_size_mb <= 2000:
                         await query.message.reply_video(
                             video=f,
                             caption=caption,
-                            read_timeout=300,
-                            write_timeout=300,
+                            read_timeout=600,
+                            write_timeout=600,
                         )
                     else:
                         await query.message.reply_document(
                             document=f,
                             caption=caption,
-                            read_timeout=300,
-                            write_timeout=300,
+                            read_timeout=600,
+                            write_timeout=600,
                         )
                 increment_user_usage(user_id)
                 success += 1
