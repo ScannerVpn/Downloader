@@ -228,14 +228,18 @@ async def fetch_aparat_playlist(url: str) -> list:
         v["id"] for v in playlist.get("relationships", {}).get("video", {}).get("data", [])
     ]
 
-    # Map video IDs to UIDs
+    # Map video IDs to UIDs and titles
     id_to_uid = {}
+    id_to_title = {}
     for item in included:
         if item.get("type") == "Video":
             vid_id = item.get("id", "")
-            uid = item.get("attributes", {}).get("uid", "")
+            attrs = item.get("attributes", {})
+            uid = attrs.get("uid", "")
+            title = attrs.get("title", "")
             if vid_id and uid:
                 id_to_uid[vid_id] = uid
+                id_to_title[vid_id] = title
 
     entries = []
     for vid_id in video_ids:
@@ -243,7 +247,7 @@ async def fetch_aparat_playlist(url: str) -> list:
         if uid:
             entries.append({
                 "url": f"https://www.aparat.com/v/{uid}",
-                "title": "",  # Will be filled during download
+                "title": id_to_title.get(vid_id, ""),
             })
 
     return entries
@@ -495,6 +499,10 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_back":
         await show_admin_panel(query)
+
+    elif data == "cancel_dl":
+        context.user_data["cancel_download"] = True
+        await query.answer("🚫 در حال لغو...")
 
     elif data.startswith("dl_one_"):
         # Download single video from playlist by index
@@ -755,17 +763,31 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
 
 
 async def download_playlist(query, entries, format_id, context):
-    """Download all videos in a playlist."""
+    """Download all videos in a playlist one by one."""
     user_id = query.from_user.id
     cfg = load_config()
+    context.user_data["cancel_download"] = False
 
     total = len(entries)
     success = 0
     failed = 0
 
+    cancel_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ لغو دانلود", callback_data="cancel_dl")]
+    ])
+
     for i, entry in enumerate(entries):
+        # Check cancel
+        if context.user_data.get("cancel_download"):
+            await query.edit_message_text(
+                f"🚫 دانلود لغو شد!\n\n"
+                f"✅ موفق: {success}/{total}\n"
+                f"❌ ناموفق: {failed}/{total}"
+            )
+            return
+
         url = entry.get("url") or entry.get("webpage_url", "")
-        title = entry.get("title", f"ویدیو {i + 1}")
+        title = entry.get("title") or f"ویدیو {i + 1}"
 
         if not url:
             failed += 1
@@ -783,9 +805,9 @@ async def download_playlist(query, entries, format_id, context):
             progress_pct = int((i / total) * 100)
             progress_bar = "█" * (progress_pct // 5) + "░" * (20 - progress_pct // 5)
             await query.edit_message_text(
-                f"⏳ دانلود {i + 1}/{total}\n"
-                f"{progress_bar} {progress_pct}%\n"
-                f"📹 {title[:50]}"
+                f"⏳ دانلود {i + 1}/{total} — {title[:40]}\n"
+                f"{progress_bar} {progress_pct}%",
+                reply_markup=cancel_keyboard,
             )
 
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -810,7 +832,12 @@ async def download_playlist(query, entries, format_id, context):
                     continue
 
                 vtitle = result["title"] or title
+                duration = format_duration(result.get("duration"))
+                size = format_size(result.get("filesize"))
                 caption = f"🎬 {vtitle} ({i + 1}/{total})"
+                if duration and duration != "0:00":
+                    caption += f"\n⏱ {duration}"
+                caption += f"\n📦 {size}"
 
                 with open(file_path, "rb") as f:
                     if file_size_mb <= 50:
@@ -838,6 +865,12 @@ async def download_playlist(query, entries, format_id, context):
         f"✅ موفق: {success}/{total}\n"
         f"❌ ناموفق: {failed}/{total}"
     )
+
+
+async def cb_cancel_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("🚫 در حال لغو...")
+    context.user_data["cancel_download"] = True
 
 
 async def post_init(application: Application):
