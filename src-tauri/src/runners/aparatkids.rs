@@ -351,9 +351,16 @@ pub async fn fetch_aparat_playlist(
     .await
     .map_err(|e| format!("Failed to parse video API response: {e}"))?;
 
+  // Find the playlist in included and extract video IDs from its relationships
   let video_ids: Vec<String> = json
-    .get("data")
-    .and_then(|d| d.get("relationships"))
+    .get("included")
+    .and_then(|i| i.as_array())
+    .and_then(|arr| {
+      arr
+        .iter()
+        .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("playlist"))
+    })
+    .and_then(|playlist| playlist.get("relationships"))
     .and_then(|r| r.get("video"))
     .and_then(|v| v.get("data"))
     .and_then(|d| d.as_array())
