@@ -301,83 +301,6 @@ async def yt_dlp_download(url: str, output_path: str, format_spec: str = "bv*+ba
     }
 
 
-async def yt_dlp_formats(url: str) -> list:
-    """Get available formats for a video."""
-    cmd = [
-        YTDLP,
-        "--encoding", "utf-8",
-        "-J",
-        "--no-playlist",
-        "--no-warnings",
-        "--no-colors",
-        url,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        return []
-
-    try:
-        info = json.loads(stdout.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return []
-
-    formats = info.get("formats", [])
-    # Filter to unique video+audio combinations
-    seen = set()
-    result = []
-    for f in formats:
-        height = f.get("height")
-        ext = f.get("ext", "")
-        vcodec = f.get("vcodec", "none")
-        acodec = f.get("acodec", "none")
-
-        if ext in ("mhtml", "storyboard"):
-            continue
-
-        # Only include formats that have video or are audio-only
-        if vcodec == "none" and acodec == "none":
-            continue
-
-        key = f"{height or 'audio'}_{ext}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        label = ""
-        if height:
-            label = f"{height}p"
-            fps = f.get("fps")
-            if fps and fps > 30:
-                label += f" {int(fps)}fps"
-        elif vcodec == "none":
-            abr = f.get("abr", 0)
-            label = f"Audio {int(abr)}k" if abr else "Audio"
-
-        if label:
-            result.append({
-                "label": label,
-                "format_id": f.get("format_id", ""),
-                "height": height,
-                "ext": ext,
-            })
-
-    # Sort by height (video) or keep audio at end
-    result.sort(key=lambda x: x.get("height") or 0, reverse=True)
-
-    # Add default options
-    options = [
-        {"label": "بهترین کیفیت", "format_id": "bv*+ba/b", "height": None, "ext": ""},
-    ]
-    for fmt in result[:8]:  # Max 8 quality options
-        options.append(fmt)
-
-    return options
-
 
 # --- Setup ---
 def first_time_setup():
@@ -574,48 +497,44 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_panel(query)
 
     elif data.startswith("dl_one_"):
-        # Download single video from playlist
-        _, idx_str, playlist_id = data.split("|", 2)
-        idx = int(idx_str)
-        context.user_data["pending_playlist"] = playlist_id
+        # Download single video from playlist by index
+        idx = int(data.split("_")[-1])
+        entries = context.user_data.get("playlist_entries", [])
         context.user_data["pending_playlist_idx"] = idx
         context.user_data["pending_action"] = "single"
-        await show_quality_selection(query, idx, playlist_id, context)
+        if idx < len(entries):
+            await show_quality_selection(query, idx, context)
 
-    elif data.startswith("dl_all_"):
+    elif data == "dl_all":
         # Download all from playlist
-        _, playlist_id = data.split("|", 1)
-        context.user_data["pending_playlist"] = playlist_id
+        entries = context.user_data.get("playlist_entries", [])
         context.user_data["pending_action"] = "all"
-        await show_quality_selection(query, -1, playlist_id, context)
-
-    elif data.startswith("dl_"):
-        # Single video download with quality
-        parts = data.split("|", 2)
-        if len(parts) == 3:
-            _, format_id, video_url = parts
-            context.user_data["dl_format"] = format_id
-            await do_download(query.from_user.id, video_url, format_id, query.message, context)
+        await show_quality_selection(query, -1, context)
 
     elif data.startswith("ql_"):
-        # Quality selected for playlist
-        parts = data.split("|", 2)
-        format_id = parts[1]
+        # Quality selected - store format and trigger download
+        fmt_key = data[3:]  # Remove "ql_" prefix
         action = context.user_data.get("pending_action", "all")
-        playlist_id = context.user_data.get("pending_playlist", "")
+        entries = context.user_data.get("playlist_entries", [])
+        idx = context.user_data.get("pending_playlist_idx", 0)
 
-        if action == "single":
-            idx = context.user_data.get("pending_playlist_idx", 0)
-            playlist_info = context.user_data.get("playlist_info", {})
-            entries = playlist_info.get("entries", [])
-            if idx < len(entries):
-                entry = entries[idx]
-                url = entry.get("url") or entry.get("webpage_url", "")
-                await query.edit_message_text("⏳ در حال دانلود...")
-                await do_download(query.from_user.id, url, format_id, query.message, context)
-        else:
-            playlist_info = context.user_data.get("playlist_info", {})
-            entries = playlist_info.get("entries", [])
+        # Resolve format spec from key
+        fmt_map = {
+            "best": "bv*+ba/b",
+            "1080": "bv*[height<=1080]+ba/b",
+            "720": "bv*[height<=720]+ba/b",
+            "480": "bv*[height<=480]+ba/b",
+            "360": "bv*[height<=360]+ba/b",
+            "audio": "ba/b",
+        }
+        format_id = fmt_map.get(fmt_key, "bv*+ba/b")
+
+        if action == "single" and idx < len(entries):
+            entry = entries[idx]
+            url = entry.get("url", "")
+            await query.edit_message_text("⏳ در حال دانلود...")
+            await do_download(query.from_user.id, url, format_id, query.message, context)
+        elif action == "all":
             await query.edit_message_text(f"⏳ در حال دانلود {len(entries)} ویدیو...")
             await download_playlist(query, entries, format_id, context)
 
@@ -668,17 +587,14 @@ async def show_user_list(query):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
-async def show_quality_selection(target, idx, playlist_id, context):
-    """Show quality selection for a download. target can be Message or CallbackQuery."""
-    playlist_info = context.user_data.get("playlist_info", {})
-    entries = playlist_info.get("entries", [])
+async def show_quality_selection(target, idx, context):
+    """Show quality selection for a download."""
+    entries = context.user_data.get("playlist_entries", [])
 
     if idx >= 0 and idx < len(entries):
         entry = entries[idx]
-        url = entry.get("url") or entry.get("webpage_url", "")
         title = entry.get("title", f"ویدیو {idx + 1}")
     else:
-        url = playlist_info.get("url", "")
         title = f"دانلود همه ({len(entries)} ویدیو)"
 
     # Update the status message
@@ -687,16 +603,14 @@ async def show_quality_selection(target, idx, playlist_id, context):
     elif hasattr(target, "edit_text"):
         await target.edit_text("⏳ دریافت کیفیت‌های موجود...")
 
-    formats = await yt_dlp_formats(url)
-    if not formats:
-        formats = [{"label": "بهترین کیفیت", "format_id": "bv*+ba/b", "height": None, "ext": ""}]
-
-    keyboard = []
-    for fmt in formats:
-        keyboard.append([InlineKeyboardButton(
-            f"📹 {fmt['label']}",
-            callback_data=f"ql_|{fmt['format_id']}"
-        )])
+    keyboard = [
+        [InlineKeyboardButton("📹 بهترین کیفیت", callback_data="ql_best")],
+        [InlineKeyboardButton("📹 1080p", callback_data="ql_1080")],
+        [InlineKeyboardButton("📹 720p", callback_data="ql_720")],
+        [InlineKeyboardButton("📹 480p", callback_data="ql_480")],
+        [InlineKeyboardButton("📹 360p", callback_data="ql_360")],
+        [InlineKeyboardButton("🎵 فقط صدا", callback_data="ql_audio")],
+    ]
 
     text = f"🎬 {title}\n\nکیفیت مورد نظر رو انتخاب کن:"
     if hasattr(target, "edit_message_text"):
@@ -742,7 +656,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if info and info.get("_type") == "playlist":
         # It's a playlist - show the list
         entries = info.get("entries", [])
-        context.user_data["playlist_info"] = info
+        context.user_data["playlist_entries"] = entries
         context.user_data["pending_action"] = "all"
 
         playlist_title = info.get("title", "پلی‌لیست")
@@ -756,13 +670,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"  ... و {len(entries) - 20} ویدیوی دیگر\n"
 
         keyboard = [
-            [InlineKeyboardButton(f"📥 دانلود همه ({len(entries)})", callback_data=f"dl_all_|{url}")],
+            [InlineKeyboardButton(f"📥 دانلود همه ({len(entries)})", callback_data="dl_all")],
         ]
         for i, entry in enumerate(entries[:10]):  # Max 10 individual buttons
             title = entry.get("title", f"ویدیو {i+1}")[:30]
             keyboard.append([InlineKeyboardButton(
                 f"📹 {i+1}. {title}",
-                callback_data=f"dl_one_|{i}|{url}"
+                callback_data=f"dl_one_{i}"
             )])
 
         await status_msg.edit_text(
@@ -771,8 +685,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         # Single video - show quality selection
-        context.user_data["playlist_info"] = {"entries": [{"url": url}], "url": url}
-        await show_quality_selection(status_msg, 0, url, context)
+        context.user_data["playlist_entries"] = [{"url": url}]
+        context.user_data["pending_action"] = "single"
+        context.user_data["pending_playlist_idx"] = 0
+        await show_quality_selection(status_msg, 0, context)
 
 
 async def do_download(user_id: int, url: str, format_id: str, message, context):
