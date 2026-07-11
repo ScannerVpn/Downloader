@@ -116,7 +116,7 @@ export const useMediaStore = defineStore('media', () => {
 
     const leader = groupStore.findGroupLeader(groupId);
     const hasPlaylistLeader = !!leader?.entries;
-    const isFirst = group.total === 1 && !hasPlaylistLeader;
+    const isFirst = group.total === 1 && total === 1 && !hasPlaylistLeader;
     if (isFirst) {
       const existingId = Object.keys(group.items)[0];
       if (existingId) delete group.items[existingId];
