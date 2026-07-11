@@ -46,6 +46,8 @@ pub fn aparat_playlist_id(url: &str) -> Option<String> {
 pub async fn resolve_aparatkids_url(url: &str) -> Result<AparatkidsResolved, String> {
   let client = reqwest::Client::builder()
     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+    .connect_timeout(std::time::Duration::from_secs(10))
+    .timeout(std::time::Duration::from_secs(30))
     .build()
     .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
@@ -319,6 +321,8 @@ pub async fn fetch_aparat_playlist(
 ) -> Result<Vec<String>, String> {
   let client = reqwest::Client::builder()
     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+    .connect_timeout(std::time::Duration::from_secs(10))
+    .timeout(std::time::Duration::from_secs(30))
     .build()
     .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 

@@ -178,8 +178,13 @@ async fn handle_fetch_entry(
   if is_aparatkids_url(&url) {
     if let Some(playlist_id) = aparat_playlist_id(&url) {
       tracing::info!(url = %url, playlist_id = %playlist_id, "Detected aparat playlist URL, fetching playlist entries");
-      match fetch_aparat_playlist(&playlist_id, &url).await {
-        Ok(video_urls) => {
+      match tokio::time::timeout(
+        std::time::Duration::from_secs(35),
+        fetch_aparat_playlist(&playlist_id, &url),
+      )
+      .await
+      {
+        Ok(Ok(video_urls)) => {
           let entries: Vec<PlaylistEntry> = video_urls
             .into_iter()
             .enumerate()
@@ -197,12 +202,19 @@ async fn handle_fetch_entry(
           }));
           return;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
           tracing::warn!(
             url = %url,
             playlist_id = %playlist_id,
             error = %e,
             "Failed to fetch aparat playlist, falling back to single video"
+          );
+        }
+        Err(_) => {
+          tracing::warn!(
+            url = %url,
+            playlist_id = %playlist_id,
+            "Timeout fetching aparat playlist, falling back to single video"
           );
         }
       }
@@ -211,12 +223,17 @@ async fn handle_fetch_entry(
 
   // Resolve AparatKids/Aparat URLs to direct m3u8 links before passing to yt-dlp
   let aparatkids_meta: Option<AparatkidsResolved> = if is_aparatkids_url(&url) {
-    match resolve_aparatkids_url(&url).await {
-      Ok(resolved) => {
+    let resolve_result = tokio::time::timeout(
+      std::time::Duration::from_secs(35),
+      resolve_aparatkids_url(&url),
+    )
+    .await;
+    match resolve_result {
+      Ok(Ok(resolved)) => {
         tracing::info!(original = %url, resolved = %resolved.m3u8_url, "Resolved AparatKids URL to m3u8");
         Some(resolved)
       }
-      Err(e) => {
+      Ok(Err(e)) => {
         tracing::warn!(
           url = %url,
           error = %e,
@@ -229,6 +246,22 @@ async fn handle_fetch_entry(
             id.clone(),
             1,
             format!("Failed to resolve AparatKids video: {e}"),
+          ),
+        );
+        return;
+      }
+      Err(_) => {
+        tracing::warn!(
+          url = %url,
+          "Timeout resolving AparatKids URL"
+        );
+        let _ = app.emit(
+          "media_fatal",
+          MediaFatalPayload::with_exit(
+            group_id.clone(),
+            id.clone(),
+            1,
+            "Timeout resolving AparatKids video URL".to_string(),
           ),
         );
         return;

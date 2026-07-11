@@ -95,8 +95,13 @@ pub fn setup_download_dispatcher(
     |tx, app: AppHandle, entry: DownloadEntry| async move {
       // Resolve AparatKids/Aparat URLs to direct m3u8 links before passing to yt-dlp
       let resolved_url = if is_aparatkids_url(&entry.url) {
-        match resolve_aparatkids_url(&entry.url).await {
-          Ok(resolved) => {
+        let resolve_result = tokio::time::timeout(
+          std::time::Duration::from_secs(35),
+          resolve_aparatkids_url(&entry.url),
+        )
+        .await;
+        match resolve_result {
+          Ok(Ok(resolved)) => {
             tracing::info!(
               original = %entry.url,
               resolved = %resolved.m3u8_url,
@@ -104,11 +109,18 @@ pub fn setup_download_dispatcher(
             );
             resolved.m3u8_url
           }
-          Err(e) => {
+          Ok(Err(e)) => {
             tracing::warn!(
               url = %entry.url,
               error = %e,
               "Failed to resolve AparatKids URL for download, using original"
+            );
+            entry.url.clone()
+          }
+          Err(_) => {
+            tracing::warn!(
+              url = %entry.url,
+              "Timeout resolving AparatKids URL for download, using original"
             );
             entry.url.clone()
           }
