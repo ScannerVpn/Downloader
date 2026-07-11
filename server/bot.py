@@ -32,6 +32,15 @@ from telegram.ext import (
 CONFIG_PATH = Path(__file__).parent / "config.json"
 DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 USAGE_FILE = Path(__file__).parent / "usage.json"
+VENV_DIR = Path(__file__).parent / "venv"
+
+# Resolve yt-dlp path: prefer venv, fall back to system
+if (VENV_DIR / "bin" / "yt-dlp").exists():
+    YTDLP = str(VENV_DIR / "bin" / "yt-dlp")
+elif (VENV_DIR / "Scripts" / "yt-dlp.exe").exists():
+    YTDLP = str(VENV_DIR / "Scripts" / "yt-dlp.exe")
+else:
+    YTDLP = "yt-dlp"
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -149,7 +158,7 @@ def format_size(size_bytes):
 async def yt_dlp_info(url: str) -> dict | None:
     """Get video/playlist info from yt-dlp."""
     cmd = [
-        "yt-dlp",
+        YTDLP,
         "--encoding", "utf-8",
         "--dump-json",
         "--flat-playlist",
@@ -174,7 +183,7 @@ async def yt_dlp_info(url: str) -> dict | None:
 async def yt_dlp_download(url: str, output_path: str, format_spec: str = "bv*+ba/b") -> dict:
     """Download a single video using yt-dlp."""
     cmd = [
-        "yt-dlp",
+        YTDLP,
         "--encoding", "utf-8",
         "-f", format_spec,
         "-o", output_path,
@@ -226,7 +235,7 @@ async def yt_dlp_download(url: str, output_path: str, format_spec: str = "bv*+ba
 async def yt_dlp_formats(url: str) -> list:
     """Get available formats for a video."""
     cmd = [
-        "yt-dlp",
+        YTDLP,
         "--encoding", "utf-8",
         "-J",
         "--no-playlist",
