@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -59,6 +60,18 @@ ALLOWED_DOMAINS = [
     "twitch.tv",
     "soundcloud.com",
 ]
+
+# Domains that may need extra anti-bot workarounds
+_YT_DOMAINS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+
+# Parse yt-dlp stderr lines like "[download]  42.3% of 10.00MiB at 500KiB/s ETA 00:10"
+YTDLP_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)\s*%")
+
+# Keyboard used for in-flight downloads (single + playlist)
+def _cancel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ لغو دانلود", callback_data="cancel_dl")]
+    ])
 
 
 def load_config():
@@ -257,8 +270,32 @@ async def fetch_aparat_playlist(url: str) -> list:
     return entries
 
 
-async def yt_dlp_download(url: str, output_path: str, format_spec: str = "bv*+ba/b") -> dict:
-    """Download a single video using yt-dlp."""
+async def yt_dlp_download(
+    url: str,
+    output_path: str,
+    format_spec: str = "bv*+ba/b",
+    progress_callback=None,
+    cancel_check=None,
+    proc_holder: dict | None = None,
+) -> dict:
+    """Download a single video using yt-dlp with live progress and cancel.
+
+    Args:
+        url: video URL
+        output_path: yt-dlp output template (e.g. "%(id)s.%(ext)s")
+        format_spec: yt-dlp format selector
+        progress_callback: async callable(percent: float, status_line: str)
+            invoked on each new download percentage (rate-limit yourself!)
+        cancel_check: sync callable() -> bool; when True the subprocess is
+            terminated and the function returns {"cancelled": True}.
+        proc_holder: optional dict; if provided, the running Popen is
+            stored under key "proc" so an external handler can terminate it.
+
+    Returns:
+        dict with keys file_path/title/thumbnail/duration/filesize/formats
+        on success, or {"error": "...", ...} on failure, or
+        {"cancelled": True, "error": "cancelled"} when aborted.
+    """
     cmd = [
         YTDLP,
         "--encoding", "utf-8",
@@ -269,30 +306,110 @@ async def yt_dlp_download(url: str, output_path: str, format_spec: str = "bv*+ba
         "--restrict-filenames",
         "--no-warnings",
         "--no-colors",
-        "--print-json",
-        url,
-    ]
+        "--newline",  # stream stderr so we can parse progress in real time
+    ]  
+
+    # YouTube extra hardening: alternate player clients + modern UA to dodge
+    # HTTP 403 / "Sign in to confirm you're not a bot" responses.
+    if any(d in url for d in _YT_DOMAINS):
+        cmd += [
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36",
+            "--extractor-args", "youtube:player_client=web,android,ios",
+        ]
+
+    cmd += ["--print-json", url]
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    if proc_holder is not None:
+        proc_holder["proc"] = proc
 
-    if proc.returncode != 0:
-        return {"error": stderr.decode("utf-8", errors="replace").strip()[:500]}
+    def _release_proc_holder():
+        if proc_holder is not None:
+            proc_holder.pop("proc", None)
 
     try:
-        info = json.loads(stdout.decode("utf-8", errors="replace"))
+        # Stream stderr so we can extract real download percentages and
+        # react to a cancel request without blocking the event loop.
+        while True:
+            if cancel_check is not None and cancel_check():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip("\n\r")
+            if not text or progress_callback is None:
+                continue
+            m = YTDLP_PROGRESS_RE.search(text)
+            if not m:
+                continue
+            try:
+                pct = float(m.group(1))
+            except ValueError:
+                continue
+            try:
+                await progress_callback(pct, text)
+            except Exception:
+                pass
+
+        stdout, stderr = await proc.communicate()
+    finally:
+        # Make sure we never leave a zombie yt-dlp behind on errors.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+
+    # Cancelled either inside the loop or externally after terminate:
+    if cancel_check is not None and cancel_check():
+        _release_proc_holder()
+        return {"cancelled": True, "error": "cancelled by user"}
+
+    _release_proc_holder()
+
+    if proc.returncode != 0:
+        err = (stderr or b"").decode("utf-8", errors="replace").strip()
+        if not err:
+            err = (stdout or b"").decode("utf-8", errors="replace").strip()
+        # Trim noisy multi-line errors to the last meaningful line.
+        if err:
+            for line in reversed(err.splitlines()):
+                line = line.strip()
+                if line and (
+                    (not line.startswith("[") and "ERROR" in line.upper())
+                    or "HTTP" in line
+                    or "Forbidden" in line
+                    or "Sign in" in line
+                ):
+                    err = line
+                    break
+        return {"error": (err or f"yt-dlp exited with code {proc.returncode}")[:500]}
+
+    try:
+        info = json.loads((stdout or b"").decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
         return {"error": "Failed to parse yt-dlp output"}
 
-    # Find the actual downloaded file
     video_id = info.get("id", "unknown")
     ext = info.get("ext", "mp4")
     file_path = Path(output_path).parent / f"{video_id}.{ext}"
 
-    # Try to find the file with any extension
     if not file_path.exists():
         parent = Path(output_path).parent
         for f in parent.glob(f"{video_id}.*"):
@@ -506,6 +623,15 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "cancel_dl":
         context.user_data["cancel_download"] = True
+        # Actively terminate the running yt-dlp instead of waiting it out.
+        holder = context.user_data.get("dl_proc_holder")
+        if isinstance(holder, dict):
+            proc = holder.get("proc")
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
         await query.answer("🚫 در حال لغو...")
 
     elif data.startswith("dl_one_"):
@@ -710,17 +836,68 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
 
     cfg = load_config()
     tmpdir = tempfile.mkdtemp()
-    status_msg = await message.reply_text("⏳ در حال دانلود ویدیو...")
+    cancel_kb = _cancel_keyboard()
+    status_msg = await message.reply_text("⏳ در حال دانلود ویدیو...", reply_markup=cancel_kb)
+
+    # Reset cancel state and arm the proc holder so the cancel button
+    # has something to terminate even from a different handler task.
+    context.user_data["cancel_download"] = False
+    proc_holder = context.user_data["dl_proc_holder"] = {}
+
+    url_hint = url[:60]
+    last_edit = [0.0]
+    bar_pct = [-1.0]
+
+    async def update_progress(pct: float, _line: str):
+        # Drop duplicate/slow updates to avoid hitting Telegram edit limits.
+        # Also stop updating immediately if the user has cancelled.
+        if context.user_data.get("cancel_download"):
+            return
+        if pct <= bar_pct[0]:
+            return
+        now = time.monotonic()
+        if now - last_edit[0] < 1.2:
+            return
+        last_edit[0] = now
+        bar_pct[0] = pct
+        filled = max(0, min(20, int(pct) // 5))
+        bar = "█" * filled + "░" * (20 - filled)
+        try:
+            await status_msg.edit_text(
+                f"⏳ در حال دانلود ({int(pct)}%)\n"
+                f"{bar}\n"
+                f"🔗 {url_hint}",
+                reply_markup=cancel_kb,
+            )
+        except Exception:
+            pass
 
     try:
         result = await yt_dlp_download(
             url,
             os.path.join(tmpdir, "%(id)s.%(ext)s"),
             format_spec=format_id,
+            progress_callback=update_progress,
+            cancel_check=lambda: context.user_data.get("cancel_download", False),
+            proc_holder=proc_holder,
         )
 
+        if result.get("cancelled"):
+            try:
+                await status_msg.edit_text("🚫 دانلود لغو شد.")
+            except Exception:
+                pass
+            return
+
         if "error" in result:
-            await status_msg.edit_text(f"❌ خطا در دانلود:\n{result['error'][:500]}")
+            err = result["error"]
+            hint = ""
+            if "403" in err or "Forbidden" in err or "Sign in" in err:
+                hint = "\n\n💡 YouTube این ویدیو رو محدود کرده. ممکنه نیاز به کوکی یا VPN باشه."
+            try:
+                await status_msg.edit_text(f"❌ خطا در دانلود:\n{err[:400]}{hint}")
+            except Exception:
+                pass
             return
 
         file_path = result["file_path"]
@@ -729,20 +906,25 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
         size = format_size(result.get("filesize"))
 
         if not file_path or not os.path.exists(file_path):
-            # Try to find the file
             for f in Path(tmpdir).glob("*.*"):
                 if f.suffix in (".mp4", ".mkv", ".webm", ".avi", ".mov"):
                     file_path = str(f)
                     break
             else:
-                await status_msg.edit_text("❌ فایل ویدیو یافت نشد.")
+                try:
+                    await status_msg.edit_text("❌ فایل ویدیو یافت نشد.")
+                except Exception:
+                    pass
                 return
 
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         if file_size_mb > cfg["max_file_size_mb"]:
-            await status_msg.edit_text(
-                f"❌ حجم فایل ({file_size_mb:.1f} MB) بیشتر از حد مجاز ({cfg['max_file_size_mb']} MB) است."
-            )
+            try:
+                await status_msg.edit_text(
+                    f"❌ حجم فایل ({file_size_mb:.1f} MB) بیشتر از حد مجاز ({cfg['max_file_size_mb']} MB) است."
+                )
+            except Exception:
+                pass
             return
 
         caption = f"🎬 {title}"
@@ -750,7 +932,13 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
             caption += f"\n⏱ {duration}"
         caption += f"\n📦 {size}"
 
-        await status_msg.edit_text(f"📤 در حال آپلود ({file_size_mb:.0f} MB)...")
+        try:
+            await status_msg.edit_text(
+                f"📤 در حال آپلود ({file_size_mb:.0f} MB)...\n🎬 {title}",
+                reply_markup=cancel_kb,
+            )
+        except Exception:
+            pass
 
         with open(file_path, "rb") as f:
             await message.reply_video(
@@ -760,7 +948,10 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
                 write_timeout=600,
                 connect_timeout=30,
             )
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
         increment_user_usage(user_id)
     except Exception as e:
         try:
@@ -769,32 +960,42 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
             pass
     finally:
         import shutil
+        context.user_data.pop("dl_proc_holder", None)
+        context.user_data["cancel_download"] = False
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def download_playlist(query, entries, format_id, context):
-    """Download all videos in a playlist one by one."""
+    """Download a playlist one video at a time with live progress.
+
+    Each iteration:
+      - Streams real download percent from yt-dlp stderr, edits status msg.
+      - Uploads BEFORE moving on. Uploads are awaited so they really run.
+      - On error for a single item we surface the cause instead of silently
+        skipping, then continue to the next entry.
+    """
     user_id = query.from_user.id
     cfg = load_config()
     context.user_data["cancel_download"] = False
+    proc_holder = context.user_data["dl_proc_holder"] = {}
 
     total = len(entries)
     success = 0
     failed = 0
 
-    cancel_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ لغو دانلود", callback_data="cancel_dl")]
-    ])
+    cancel_kb = _cancel_keyboard()
+
+    def _summary():
+        return f"✅ دانلود پلی‌لیست تمام شد!\n\n✅ موفق: {success}/{total}\n❌ ناموفق: {failed}/{total}"
+
+    def _cancel_summary():
+        return f"🚫 دانلود لغو شد!\n\n✅ موفق: {success}/{total}\n❌ ناموفق: {failed}/{total}"
 
     for i, entry in enumerate(entries):
-        # Check cancel
+        # Pre-loop cancel check
         if context.user_data.get("cancel_download"):
             try:
-                await query.edit_message_text(
-                    f"🚫 دانلود لغو شد!\n\n"
-                    f"✅ موفق: {success}/{total}\n"
-                    f"❌ ناموفق: {failed}/{total}"
-                )
+                await query.edit_message_text(_cancel_summary(), reply_markup=None)
             except Exception:
                 pass
             return
@@ -808,25 +1009,40 @@ async def download_playlist(query, entries, format_id, context):
 
         if not can_download(user_id):
             try:
-                await query.edit_message_text(
-                    f"⛔ سقف دانلود تمام شد!\n"
-                    f"✅ موفق: {success}/{total}\n"
-                    f"❌ ناموفق: {failed}/{total}"
-                )
+                await query.edit_message_text(_cancel_summary(), reply_markup=None)
             except Exception:
                 pass
             return
 
-        progress_pct = int(((i) / total) * 100)
-        progress_bar = "█" * (progress_pct // 5) + "░" * (20 - progress_pct // 5)
+        # Initial message for this item.
         try:
             await query.edit_message_text(
                 f"⏳ دانلود {i + 1}/{total} — {title[:40]}\n"
-                f"{progress_bar} {progress_pct}%",
-                reply_markup=cancel_keyboard,
+                f"در حال شروع...",
+                reply_markup=cancel_kb,
             )
         except Exception:
             pass
+
+        last_edit = [0.0]
+
+        async def update_progress(pct: float, _line: str, idx=i):
+            if context.user_data.get("cancel_download"):
+                return
+            now = time.monotonic()
+            if now - last_edit[0] < 1.2:
+                return
+            last_edit[0] = now
+            filled = max(0, min(20, int(pct) // 5))
+            bar = "█" * filled + "░" * (20 - filled)
+            try:
+                await query.edit_message_text(
+                    f"⏳ دانلود {idx + 1}/{total} — {title[:40]}\n"
+                    f"{bar} {int(pct)}%",
+                    reply_markup=cancel_kb,
+                )
+            except Exception:
+                pass
 
         tmpdir = tempfile.mkdtemp()
         try:
@@ -834,9 +1050,29 @@ async def download_playlist(query, entries, format_id, context):
                 url,
                 os.path.join(tmpdir, "%(id)s.%(ext)s"),
                 format_spec=format_id,
+                progress_callback=update_progress,
+                cancel_check=lambda: context.user_data.get("cancel_download", False),
+                proc_holder=proc_holder,
             )
 
+            if result.get("cancelled"):
+                try:
+                    await query.edit_message_text(_cancel_summary(), reply_markup=None)
+                except Exception:
+                    pass
+                return
+
             if "error" in result:
+                err = result["error"][:300]
+                # Surface the failure so the user can see why we skipped.
+                try:
+                    await query.edit_message_text(
+                        f"⏭️ خطا: {i + 1}/{total} — {title[:40]}\n"
+                        f"❌ {err}",
+                        reply_markup=cancel_kb,
+                    )
+                except Exception:
+                    pass
                 failed += 1
                 continue
 
@@ -852,6 +1088,14 @@ async def download_playlist(query, entries, format_id, context):
 
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             if file_size_mb > cfg["max_file_size_mb"]:
+                try:
+                    await query.edit_message_text(
+                        f"⏭️ خیلی بزرگ: {i + 1}/{total} — {title[:40]}\n"
+                        f"❌ {file_size_mb:.0f} MB بیشتر از حد مجاز ({cfg['max_file_size_mb']} MB)",
+                        reply_markup=cancel_kb,
+                    )
+                except Exception:
+                    pass
                 failed += 1
                 continue
 
@@ -863,24 +1107,20 @@ async def download_playlist(query, entries, format_id, context):
                 caption += f"\n⏱ {duration}"
             caption += f"\n📦 {size}"
 
-            # Check cancel before upload
+            # Cancel check BEFORE the (potentially long) upload step.
             if context.user_data.get("cancel_download"):
                 try:
-                    await query.edit_message_text(
-                        f"🚫 دانلود لغو شد!\n\n"
-                        f"✅ موفق: {success}/{total}\n"
-                        f"❌ ناموفق: {failed}/{total}"
-                    )
+                    await query.edit_message_text(_cancel_summary(), reply_markup=None)
                 except Exception:
                     pass
                 return
 
-            # Show upload status
+            # Upload BEFORE moving on to the next entry.
             try:
                 await query.edit_message_text(
                     f"📤 آپلود {i + 1}/{total} — {vtitle[:40]}\n"
                     f"📦 {size}",
-                    reply_markup=cancel_keyboard,
+                    reply_markup=cancel_kb,
                 )
             except Exception:
                 pass
@@ -896,26 +1136,38 @@ async def download_playlist(query, entries, format_id, context):
             increment_user_usage(user_id)
             success += 1
 
-        except Exception:
+            # Briefly celebrate, then proceed to next entry.
+            try:
+                await query.edit_message_text(
+                    f"✅ ارسال شد {success}/{total} — {vtitle[:40]}",
+                    reply_markup=cancel_kb,
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
             failed += 1
+            try:
+                await query.edit_message_text(
+                    f"⏭️ خطا: {i + 1}/{total} — {title[:30]}\n"
+                    f"❌ {str(e)[:200]}",
+                    reply_markup=cancel_kb,
+                )
+            except Exception:
+                pass
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    # Always clear the proc holder so a stale cancelled state from a
+    # mid-playlist `return` never leaks into the next download.
+    context.user_data.pop("dl_proc_holder", None)
+    context.user_data["cancel_download"] = False
+
     try:
-        await query.edit_message_text(
-            f"✅ دانلود پلی‌لیست تمام شد!\n\n"
-            f"✅ موفق: {success}/{total}\n"
-            f"❌ ناموفق: {failed}/{total}"
-        )
+        await query.edit_message_text(_summary(), reply_markup=None)
     except Exception:
         pass
-
-
-async def cb_cancel_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("🚫 در حال لغو...")
-    context.user_data["cancel_download"] = True
 
 
 async def post_init(application: Application):
