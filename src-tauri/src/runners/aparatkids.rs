@@ -6,13 +6,17 @@ static APARATKIDS_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
   Regex::new(r"https?://(?:www\.)?aparatkids\.com/(?:w|m)/([a-zA-Z0-9]+)").unwrap()
 });
 
-static APARAT_VIDEO_RE: LazyLock<Regex> = LazyLock::new(|| {
-  Regex::new(r"https?://(?:www\.)?aparat\.com/v/([a-zA-Z0-9]+)").unwrap()
-});
+static APARAT_VIDEO_RE: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"https?://(?:www\.)?aparat\.com/v/([a-zA-Z0-9]+)").unwrap());
 
-static APARAT_MOVIE_RE: LazyLock<Regex> = LazyLock::new(|| {
-  Regex::new(r"https?://(?:www\.)?aparat\.com/m/([a-zA-Z0-9]+)").unwrap()
-});
+static APARAT_MOVIE_RE: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"https?://(?:www\.)?aparat\.com/m/([a-zA-Z0-9]+)").unwrap());
+
+static APARAT_SHORTS_RE: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"https?://(?:www\.)?aparat\.com/shorts/(\d+)").unwrap());
+
+static APARAT_PLAYLIST_PARAM_RE: LazyLock<Regex> =
+  LazyLock::new(|| Regex::new(r"[?&]playlist=(\d+)").unwrap());
 
 pub struct AparatkidsResolved {
   pub m3u8_url: String,
@@ -26,6 +30,15 @@ pub fn is_aparatkids_url(url: &str) -> bool {
   APARATKIDS_URL_RE.is_match(url)
     || APARAT_VIDEO_RE.is_match(url)
     || APARAT_MOVIE_RE.is_match(url)
+    || APARAT_SHORTS_RE.is_match(url)
+}
+
+/// Check if a URL has a playlist query parameter
+pub fn aparat_playlist_id(url: &str) -> Option<String> {
+  APARAT_PLAYLIST_PARAM_RE
+    .captures(url)
+    .and_then(|caps| caps.get(1))
+    .map(|m| m.as_str().to_string())
 }
 
 pub async fn resolve_aparatkids_url(url: &str) -> Result<AparatkidsResolved, String> {
@@ -34,7 +47,9 @@ pub async fn resolve_aparatkids_url(url: &str) -> Result<AparatkidsResolved, Str
     .build()
     .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
-  if APARAT_VIDEO_RE.is_match(url) {
+  if APARAT_SHORTS_RE.is_match(url) {
+    resolve_aparat_shorts(&client, url).await
+  } else if APARAT_VIDEO_RE.is_match(url) {
     resolve_aparat_video(&client, url).await
   } else if APARAT_MOVIE_RE.is_match(url) {
     resolve_aparat_movie(&client, url).await
@@ -109,17 +124,14 @@ async fn resolve_aparat_video(
     .or_else(|| {
       // Some APIs return duration in seconds and bitrate, estimate filesize
       let dur = duration?;
-      let bitrate = attrs
-        .get("bitrate")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-          attrs
-            .get("encodings")
-            .and_then(|e| e.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|e| e.get("bitrate"))
-            .and_then(|v| v.as_u64())
-        })?;
+      let bitrate = attrs.get("bitrate").and_then(|v| v.as_u64()).or_else(|| {
+        attrs
+          .get("encodings")
+          .and_then(|e| e.as_array())
+          .and_then(|arr| arr.first())
+          .and_then(|e| e.get("bitrate"))
+          .and_then(|v| v.as_u64())
+      })?;
       if bitrate > 0 {
         Some((dur * bitrate as f64 / 8.0) as u64)
       } else {
@@ -222,6 +234,159 @@ async fn resolve_aparat_movie(
     duration,
     filesize,
   })
+}
+
+/// Resolve aparat.com /shorts/ URLs - shorts use numeric IDs that can be looked up via the video API
+async fn resolve_aparat_shorts(
+  client: &reqwest::Client,
+  url: &str,
+) -> Result<AparatkidsResolved, String> {
+  let caps = APARAT_SHORTS_RE
+    .captures(url)
+    .ok_or_else(|| "Invalid aparat.com shorts URL".to_string())?;
+  let shorts_id = caps.get(1).unwrap().as_str();
+
+  // Aparat shorts are videos; try the video API with the numeric ID
+  let api_url = format!(
+    "https://www.aparat.com/api/fa/v1/video/video/show/videohash/{}?pr=1&mf=1",
+    shorts_id
+  );
+
+  let resp = client
+    .get(&api_url)
+    .header("Referer", "https://www.aparat.com/")
+    .header("Accept", "application/json")
+    .send()
+    .await
+    .map_err(|e| format!("Failed to fetch shorts API: {e}"))?;
+
+  let status = resp.status();
+  if !status.is_success() {
+    return Err(format!("Shorts API returned status {}", status));
+  }
+
+  let json: Value = resp
+    .json()
+    .await
+    .map_err(|e| format!("Failed to parse shorts API response: {e}"))?;
+
+  let attrs = json
+    .get("data")
+    .and_then(|d| d.get("attributes"))
+    .ok_or_else(|| "Invalid API response: missing video attributes".to_string())?;
+
+  let m3u8_url = extract_aparat_m3u8(attrs)?;
+
+  let title = attrs
+    .get("title")
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_string());
+
+  let thumbnail = attrs
+    .get("big_poster")
+    .or_else(|| attrs.get("medium_poster"))
+    .or_else(|| attrs.get("small_poster"))
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_string());
+
+  let duration = attrs
+    .get("duration")
+    .and_then(|v| v.as_f64())
+    .filter(|&d| d > 0.0);
+
+  let filesize = attrs
+    .get("filesize")
+    .or_else(|| attrs.get("size"))
+    .and_then(|v| v.as_u64())
+    .filter(|&s| s > 0);
+
+  Ok(AparatkidsResolved {
+    m3u8_url,
+    title,
+    thumbnail,
+    duration,
+    filesize,
+  })
+}
+
+/// Fetch all video URLs from an aparat playlist
+pub async fn fetch_aparat_playlist(playlist_id: &str) -> Result<Vec<String>, String> {
+  let client = reqwest::Client::builder()
+    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+    .build()
+    .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+  let api_url = format!(
+    "https://www.aparat.com/api/fa/v1/playlist/playlist/show/playlistid/{}",
+    playlist_id
+  );
+
+  let resp = client
+    .get(&api_url)
+    .header("Referer", "https://www.aparat.com/")
+    .header("Accept", "application/json")
+    .send()
+    .await
+    .map_err(|e| format!("Failed to fetch playlist API: {e}"))?;
+
+  let status = resp.status();
+  if !status.is_success() {
+    return Err(format!("Playlist API returned status {}", status));
+  }
+
+  let json: Value = resp
+    .json()
+    .await
+    .map_err(|e| format!("Failed to parse playlist API response: {e}"))?;
+
+  let mut urls = Vec::new();
+
+  // Try data.attributes.playlist.items
+  if let Some(items) = json
+    .get("data")
+    .and_then(|d| d.get("attributes"))
+    .and_then(|a| a.get("items"))
+    .and_then(|i| i.as_array())
+  {
+    for item in items {
+      if let Some(hash) = item
+        .get("video_hash")
+        .or_else(|| item.get("videoHash"))
+        .and_then(|v| v.as_str())
+      {
+        let url = format!("https://www.aparat.com/v/{}", hash);
+        urls.push(url);
+      }
+    }
+  }
+
+  // Fallback: try data.attributes.videos
+  if urls.is_empty() {
+    if let Some(videos) = json
+      .get("data")
+      .and_then(|d| d.get("attributes"))
+      .and_then(|a| a.get("videos"))
+      .and_then(|v| v.as_array())
+    {
+      for video in videos {
+        if let Some(hash) = video
+          .get("video_hash")
+          .or_else(|| video.get("videoHash"))
+          .or_else(|| video.get("hash"))
+          .and_then(|v| v.as_str())
+        {
+          let url = format!("https://www.aparat.com/v/{}", hash);
+          urls.push(url);
+        }
+      }
+    }
+  }
+
+  if urls.is_empty() {
+    return Err("No videos found in playlist API response".to_string());
+  }
+
+  Ok(urls)
 }
 
 fn extract_aparat_m3u8(attrs: &Value) -> Result<String, String> {
@@ -344,7 +509,8 @@ fn extract_from_player_data(html: &str) -> Option<String> {
 }
 
 fn extract_from_og_video(html: &str) -> Option<String> {
-  let re = Regex::new(r#"<meta\s+(?:property|name)=["']og:video["']\s+content=["']([^"']+)["']"#).ok()?;
+  let re =
+    Regex::new(r#"<meta\s+(?:property|name)=["']og:video["']\s+content=["']([^"']+)["']"#).ok()?;
   let caps = re.captures(html)?;
   let url = caps.get(1)?.as_str().to_string();
   if url.contains("m3u8") || url.contains(".mp4") {
@@ -387,7 +553,8 @@ fn extract_thumbnail(html: &str) -> Option<String> {
   if let Some(poster) = extract_ux_event_field(html, "poster") {
     return Some(poster);
   }
-  let re = Regex::new(r#"<meta\s+(?:property|name)=["']og:image["']\s+content=["']([^"']+)["']"#).ok()?;
+  let re =
+    Regex::new(r#"<meta\s+(?:property|name)=["']og:image["']\s+content=["']([^"']+)["']"#).ok()?;
   let caps = re.captures(html)?;
   let url = caps.get(1)?.as_str().trim().to_string();
   if url.is_empty() {
@@ -405,7 +572,9 @@ fn extract_duration(html: &str) -> Option<f64> {
       }
     }
   }
-  let re = Regex::new(r#"<meta\s+(?:property|name)=["']video:duration["']\s+content=["'](\d+)["']"#).ok()?;
+  let re =
+    Regex::new(r#"<meta\s+(?:property|name)=["']video:duration["']\s+content=["'](\d+)["']"#)
+      .ok()?;
   let caps = re.captures(html)?;
   let dur_str = caps.get(1)?.as_str();
   dur_str.parse::<f64>().ok()
@@ -422,7 +591,33 @@ mod tests {
     assert!(is_aparatkids_url("https://www.aparat.com/v/lyo8514"));
     assert!(is_aparatkids_url("https://www.aparat.com/m/bdmq6"));
     assert!(is_aparatkids_url("https://www.aparat.com/m/5afnr"));
+    assert!(is_aparatkids_url(
+      "https://www.aparat.com/shorts/2069019368604831744"
+    ));
+    assert!(is_aparatkids_url("https://aparat.com/v/abc123"));
+    assert!(is_aparatkids_url(
+      "https://www.aparat.com/v/yswc201?playlist=22795929"
+    ));
     assert!(!is_aparatkids_url("https://youtube.com/watch?v=abc"));
+  }
+
+  #[test]
+  fn test_aparat_playlist_id() {
+    assert_eq!(
+      aparat_playlist_id(
+        "https://www.aparat.com/v/yswc201?playlist=22795929&refererRef=channel_page"
+      ),
+      Some("22795929".to_string())
+    );
+    assert_eq!(
+      aparat_playlist_id("https://www.aparat.com/v/abc?foo=bar&playlist=12345"),
+      Some("12345".to_string())
+    );
+    assert_eq!(
+      aparat_playlist_id("https://www.aparat.com/v/abc?playlist=999"),
+      Some("999".to_string())
+    );
+    assert_eq!(aparat_playlist_id("https://www.aparat.com/v/abc"), None);
   }
 
   #[test]
@@ -443,7 +638,8 @@ mod tests {
 
   #[test]
   fn test_extract_thumbnail() {
-    let html = r#"uxEvents.movie.poster="https://static.cdn.asset.filimo.com/flmt/mov_177556_347970.jpg";"#;
+    let html =
+      r#"uxEvents.movie.poster="https://static.cdn.asset.filimo.com/flmt/mov_177556_347970.jpg";"#;
     let thumb = extract_thumbnail(html);
     assert!(thumb.is_some());
     assert!(thumb.unwrap().contains("filimo.com"));

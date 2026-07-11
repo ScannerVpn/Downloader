@@ -1,7 +1,10 @@
 use crate::models::download::{DownloadOverrides, FormatOptions};
 use crate::models::payloads::MediaAddWithFormatPayload;
 use crate::models::{MediaAddPayload, MediaFatalPayload, PlaylistEntry};
-use crate::runners::aparatkids::{is_aparatkids_url, resolve_aparatkids_url, AparatkidsResolved};
+use crate::runners::aparatkids::{
+  aparat_playlist_id, fetch_aparat_playlist, is_aparatkids_url, resolve_aparatkids_url,
+  AparatkidsResolved,
+};
 use crate::runners::ytdlp_info::{run_ytdlp_info_fetch, YtdlpInfoFetchError};
 use crate::{
   models::{ParsedMedia, ParsedPlaylist},
@@ -170,6 +173,41 @@ async fn handle_fetch_entry(
     format,
     overrides,
   } = entry.clone();
+
+  // Check if this is an aparat playlist URL and expand it
+  if is_aparatkids_url(&url) {
+    if let Some(playlist_id) = aparat_playlist_id(&url) {
+      tracing::info!(url = %url, playlist_id = %playlist_id, "Detected aparat playlist URL, fetching playlist entries");
+      match fetch_aparat_playlist(&playlist_id).await {
+        Ok(video_urls) => {
+          let entries: Vec<PlaylistEntry> = video_urls
+            .into_iter()
+            .enumerate()
+            .map(|(idx, video_url)| PlaylistEntry {
+              video_url,
+              index: idx,
+            })
+            .collect();
+          let total = entries.len();
+          tracing::info!(playlist_id = %playlist_id, count = total, "Fetched aparat playlist entries");
+          let _ = tx.send(DispatchRequest::Pipeline(FetchRequest::Playlist {
+            group_id,
+            entries,
+            overrides: Box::new(overrides),
+          }));
+          return;
+        }
+        Err(e) => {
+          tracing::warn!(
+            url = %url,
+            playlist_id = %playlist_id,
+            error = %e,
+            "Failed to fetch aparat playlist, falling back to single video"
+          );
+        }
+      }
+    }
+  }
 
   // Resolve AparatKids/Aparat URLs to direct m3u8 links before passing to yt-dlp
   let aparatkids_meta: Option<AparatkidsResolved> = if is_aparatkids_url(&url) {
