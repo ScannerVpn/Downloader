@@ -396,6 +396,7 @@ export const useMediaStore = defineStore('media', () => {
     const playlistIndex = resolvePlaylistIndex(item.playlistIndex, group.playlistCount, reversePlaylistNumbering);
 
     return {
+      title: item.title || undefined,
       playlist_index: playlistIndex?.toString(),
       playlist_id: group.playlistId ?? undefined,
       playlist_title: group.playlistTitle ?? undefined,
