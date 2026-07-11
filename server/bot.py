@@ -35,12 +35,14 @@ USAGE_FILE = Path(__file__).parent / "usage.json"
 VENV_DIR = Path(__file__).parent / "venv"
 
 # Resolve yt-dlp path: prefer venv, fall back to system
-if (VENV_DIR / "bin" / "yt-dlp").exists():
-    YTDLP = str(VENV_DIR / "bin" / "yt-dlp")
-elif (VENV_DIR / "Scripts" / "yt-dlp.exe").exists():
-    YTDLP = str(VENV_DIR / "Scripts" / "yt-dlp.exe")
-else:
-    YTDLP = "yt-dlp"
+import shutil
+_ytdlp_candidates = [
+    VENV_DIR / "bin" / "yt-dlp",
+    VENV_DIR / "Scripts" / "yt-dlp.exe",
+]
+YTDLP = next((str(p) for p in _ytdlp_candidates if p.exists()), None)
+if not YTDLP:
+    YTDLP = shutil.which("yt-dlp") or "yt-dlp"
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -599,8 +601,8 @@ async def show_user_list(query):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
-async def show_quality_selection(query, idx, playlist_id, context):
-    """Show quality selection for a download."""
+async def show_quality_selection(target, idx, playlist_id, context):
+    """Show quality selection for a download. target can be Message or CallbackQuery."""
     playlist_info = context.user_data.get("playlist_info", {})
     entries = playlist_info.get("entries", [])
 
@@ -609,11 +611,14 @@ async def show_quality_selection(query, idx, playlist_id, context):
         url = entry.get("url") or entry.get("webpage_url", "")
         title = entry.get("title", f"ویدیو {idx + 1}")
     else:
-        # For "download all", use the playlist URL
         url = playlist_info.get("url", "")
         title = f"دانلود همه ({len(entries)} ویدیو)"
 
-    await query.edit_message_text(f"⏳ دریافت کیفیت‌های موجود...")
+    # Update the status message
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text("⏳ دریافت کیفیت‌های موجود...")
+    elif hasattr(target, "edit_text"):
+        await target.edit_text("⏳ دریافت کیفیت‌های موجود...")
 
     formats = await yt_dlp_formats(url)
     if not formats:
@@ -627,7 +632,10 @@ async def show_quality_selection(query, idx, playlist_id, context):
         )])
 
     text = f"🎬 {title}\n\nکیفیت مورد نظر رو انتخاب کن:"
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    elif hasattr(target, "edit_text"):
+        await target.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
