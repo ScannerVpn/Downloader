@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use regex::Regex;
 use serde_json::Value;
 use std::sync::LazyLock;
@@ -309,16 +311,26 @@ async fn resolve_aparat_shorts(
   })
 }
 
-/// Fetch all video URLs from an aparat playlist
-pub async fn fetch_aparat_playlist(playlist_id: &str) -> Result<Vec<String>, String> {
+/// Fetch all video URLs from an aparat playlist by querying the video API
+/// The playlist data is embedded in the video API response under relationships.video.data and included
+pub async fn fetch_aparat_playlist(
+  playlist_id: &str,
+  first_video_url: &str,
+) -> Result<Vec<String>, String> {
   let client = reqwest::Client::builder()
     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
     .build()
     .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
+  let video_hash = APARAT_VIDEO_RE
+    .captures(first_video_url)
+    .and_then(|caps| caps.get(1))
+    .map(|m| m.as_str())
+    .ok_or_else(|| "Cannot extract video hash from URL".to_string())?;
+
   let api_url = format!(
-    "https://www.aparat.com/api/fa/v1/playlist/playlist/show/playlistid/{}",
-    playlist_id
+    "https://www.aparat.com/api/fa/v1/video/video/show/videohash/{}?pr=1&mf=1",
+    video_hash
   );
 
   let resp = client
@@ -327,65 +339,67 @@ pub async fn fetch_aparat_playlist(playlist_id: &str) -> Result<Vec<String>, Str
     .header("Accept", "application/json")
     .send()
     .await
-    .map_err(|e| format!("Failed to fetch playlist API: {e}"))?;
+    .map_err(|e| format!("Failed to fetch video API: {e}"))?;
 
   let status = resp.status();
   if !status.is_success() {
-    return Err(format!("Playlist API returned status {}", status));
+    return Err(format!("Video API returned status {}", status));
   }
 
   let json: Value = resp
     .json()
     .await
-    .map_err(|e| format!("Failed to parse playlist API response: {e}"))?;
+    .map_err(|e| format!("Failed to parse video API response: {e}"))?;
 
-  let mut urls = Vec::new();
-
-  // Try data.attributes.playlist.items
-  if let Some(items) = json
+  let video_ids: Vec<String> = json
     .get("data")
-    .and_then(|d| d.get("attributes"))
-    .and_then(|a| a.get("items"))
-    .and_then(|i| i.as_array())
-  {
-    for item in items {
-      if let Some(hash) = item
-        .get("video_hash")
-        .or_else(|| item.get("videoHash"))
-        .and_then(|v| v.as_str())
-      {
-        let url = format!("https://www.aparat.com/v/{}", hash);
-        urls.push(url);
+    .and_then(|d| d.get("relationships"))
+    .and_then(|r| r.get("video"))
+    .and_then(|v| v.get("data"))
+    .and_then(|d| d.as_array())
+    .map(|arr| {
+      arr
+        .iter()
+        .filter_map(|item| item.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect()
+    })
+    .unwrap_or_default();
+
+  if video_ids.is_empty() {
+    return Err("No playlist entries found in API response".to_string());
+  }
+
+  let mut id_to_uid: HashMap<String, String> = HashMap::new();
+  if let Some(included) = json.get("included").and_then(|i| i.as_array()) {
+    for item in included {
+      if let (Some(id), Some(uid)) = (
+        item.get("id").and_then(|v| v.as_str()),
+        item
+          .get("attributes")
+          .and_then(|a| a.get("uid"))
+          .and_then(|u| u.as_str()),
+      ) {
+        id_to_uid.insert(id.to_string(), uid.to_string());
       }
     }
   }
 
-  // Fallback: try data.attributes.videos
-  if urls.is_empty() {
-    if let Some(videos) = json
-      .get("data")
-      .and_then(|d| d.get("attributes"))
-      .and_then(|a| a.get("videos"))
-      .and_then(|v| v.as_array())
-    {
-      for video in videos {
-        if let Some(hash) = video
-          .get("video_hash")
-          .or_else(|| video.get("videoHash"))
-          .or_else(|| video.get("hash"))
-          .and_then(|v| v.as_str())
-        {
-          let url = format!("https://www.aparat.com/v/{}", hash);
-          urls.push(url);
-        }
-      }
+  let mut urls: Vec<String> = Vec::new();
+  for video_id in &video_ids {
+    if let Some(uid) = id_to_uid.get(video_id) {
+      urls.push(format!("https://www.aparat.com/v/{}", uid));
     }
   }
 
   if urls.is_empty() {
-    return Err("No videos found in playlist API response".to_string());
+    return Err("Could not map playlist video IDs to URLs".to_string());
   }
 
+  tracing::info!(
+    playlist_id = %playlist_id,
+    count = urls.len(),
+    "Resolved aparat playlist entries"
+  );
   Ok(urls)
 }
 
@@ -651,5 +665,75 @@ mod tests {
     let dur = extract_duration(html);
     assert!(dur.is_some());
     assert_eq!(dur.unwrap(), 1071.0);
+  }
+
+  #[test]
+  fn test_extract_playlist_item_url_video_hash() {
+    let item = serde_json::json!({
+      "video_hash": "yswc201",
+      "title": "Test Video"
+    });
+    let url = extract_playlist_item_url(&item);
+    assert_eq!(url, Some("https://www.aparat.com/v/yswc201".to_string()));
+  }
+
+  #[test]
+  fn test_extract_playlist_item_url_video_hash_camel() {
+    let item = serde_json::json!({
+      "videoHash": "abc123"
+    });
+    let url = extract_playlist_item_url(&item);
+    assert_eq!(url, Some("https://www.aparat.com/v/abc123".to_string()));
+  }
+
+  #[test]
+  fn test_extract_playlist_item_url_shorts_id() {
+    let item = serde_json::json!({
+      "shorts_id": 2069019368604831744i64
+    });
+    let url = extract_playlist_item_url(&item);
+    assert_eq!(
+      url,
+      Some("https://www.aparat.com/shorts/2069019368604831744".to_string())
+    );
+  }
+
+  #[test]
+  fn test_extract_playlist_item_url_numeric_hash_is_shorts() {
+    let item = serde_json::json!({
+      "hash": "2069019368604831744"
+    });
+    let url = extract_playlist_item_url(&item);
+    assert_eq!(
+      url,
+      Some("https://www.aparat.com/shorts/2069019368604831744".to_string())
+    );
+  }
+
+  #[test]
+  fn test_extract_playlist_item_url_alphanumeric_hash_is_video() {
+    let item = serde_json::json!({
+      "hash": "yswc201"
+    });
+    let url = extract_playlist_item_url(&item);
+    assert_eq!(url, Some("https://www.aparat.com/v/yswc201".to_string()));
+  }
+
+  #[test]
+  fn test_extract_playlist_item_url_full_url_field() {
+    let item = serde_json::json!({
+      "url": "https://www.aparat.com/shorts/12345"
+    });
+    let url = extract_playlist_item_url(&item);
+    assert_eq!(url, Some("https://www.aparat.com/shorts/12345".to_string()));
+  }
+
+  #[test]
+  fn test_extract_playlist_item_url_empty() {
+    let item = serde_json::json!({
+      "title": "No URL"
+    });
+    let url = extract_playlist_item_url(&item);
+    assert_eq!(url, None);
   }
 }

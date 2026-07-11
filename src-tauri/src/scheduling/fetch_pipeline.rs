@@ -178,7 +178,7 @@ async fn handle_fetch_entry(
   if is_aparatkids_url(&url) {
     if let Some(playlist_id) = aparat_playlist_id(&url) {
       tracing::info!(url = %url, playlist_id = %playlist_id, "Detected aparat playlist URL, fetching playlist entries");
-      match fetch_aparat_playlist(&playlist_id).await {
+      match fetch_aparat_playlist(&playlist_id, &url).await {
         Ok(video_urls) => {
           let entries: Vec<PlaylistEntry> = video_urls
             .into_iter()
