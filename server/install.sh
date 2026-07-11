@@ -17,26 +17,29 @@ elif command -v apk &> /dev/null; then
 elif command -v pacman &> /dev/null; then
     PKG="pacman"
 else
-    echo "Package manager not found. Install python3, pip, ffmpeg manually."
+    echo "Package manager not found. Install python3 and ffmpeg manually."
     exit 1
 fi
 
 echo "[1/5] Installing system dependencies..."
 if [ "$PKG" = "apt-get" ]; then
     sudo apt-get update -qq
-    sudo apt-get install -y -qq python3 python3-pip ffmpeg
+    sudo apt-get install -y -qq python3 python3-venv ffmpeg
 elif [ "$PKG" = "yum" ]; then
-    sudo yum install -y python3 python3-pip ffmpeg
+    sudo yum install -y python3 ffmpeg
 elif [ "$PKG" = "dnf" ]; then
-    sudo dnf install -y python3 python3-pip ffmpeg
+    sudo dnf install -y python3 ffmpeg
 elif [ "$PKG" = "apk" ]; then
     apk add python3 py3-pip ffmpeg
 elif [ "$PKG" = "pacman" ]; then
-    sudo pacman -S --noconfirm python python-pip ffmpeg
+    sudo pacman -S --noconfirm python ffmpeg
 fi
 
-echo "[2/5] Installing Python packages..."
-pip3 install -r requirements.txt
+echo "[2/5] Setting up Python virtual environment..."
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip -q
+pip install -r requirements.txt -q
 
 echo "[3/5] Configuring bot..."
 python3 -c "
@@ -81,7 +84,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$BOT_DIR
-ExecStart=$(which python3) bot.py
+ExecStart=$BOT_DIR/venv/bin/python bot.py
 Restart=always
 RestartSec=5
 
@@ -93,7 +96,7 @@ EOF
     sudo systemctl start aparatkids-bot
     echo "Service installed and started!"
 else
-    echo "Start manually: python3 bot.py"
+    echo "Start manually: venv/bin/python bot.py"
 fi
 
 echo ""
