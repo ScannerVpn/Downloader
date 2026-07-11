@@ -8,10 +8,9 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 import sys
-import time
-from datetime import datetime, timedelta
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from telegram import (
@@ -35,6 +34,20 @@ DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 USAGE_FILE = Path(__file__).parent / "usage.json"
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# YouTube links that are allowed (in addition to aparat)
+ALLOWED_DOMAINS = [
+    "aparat.com", "aparatkids.com",
+    "youtube.com", "youtu.be",
+    "instagram.com", "www.instagram.com",
+    "tiktok.com", "vm.tiktok.com",
+    "twitter.com", "x.com",
+    "facebook.com", "fb.watch",
+    "reddit.com", "v.redd.it",
+    "dailymotion.com",
+    "twitch.tv",
+    "soundcloud.com",
+]
 
 
 def load_config():
@@ -95,12 +108,197 @@ def get_remaining(user_id: int) -> int:
     return max(0, cfg["daily_limit"] - get_user_usage(user_id))
 
 
-def is_aparat_url(url: str) -> bool:
-    patterns = [
-        r"https?://(?:www\.)?aparat\.com/(?:v|m|shorts)/",
-        r"https?://(?:www\.)?aparatkids\.com/(?:w|m)/",
+def is_allowed_url(url: str) -> bool:
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
+    except Exception:
+        return False
+
+
+def extract_url(text: str) -> str | None:
+    url_pattern = re.compile(r"https?://[^\s<>\"']+")
+    match = url_pattern.search(text)
+    return match.group(0) if match else None
+
+
+def format_duration(seconds):
+    if not seconds:
+        return ""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def format_size(size_bytes):
+    if not size_bytes:
+        return "نامشخص"
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
+# --- yt-dlp helpers ---
+async def yt_dlp_info(url: str) -> dict | None:
+    """Get video/playlist info from yt-dlp."""
+    cmd = [
+        "yt-dlp",
+        "--encoding", "utf-8",
+        "--dump-json",
+        "--flat-playlist",
+        "--no-warnings",
+        "--no-colors",
+        url,
     ]
-    return any(re.search(p, url) for p in patterns)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return None
+
+
+async def yt_dlp_download(url: str, output_path: str, format_spec: str = "bv*+ba/b") -> dict:
+    """Download a single video using yt-dlp."""
+    cmd = [
+        "yt-dlp",
+        "--encoding", "utf-8",
+        "-f", format_spec,
+        "-o", output_path,
+        "--no-playlist",
+        "--merge-output-format", "mp4",
+        "--restrict-filenames",
+        "--no-warnings",
+        "--no-colors",
+        "--print-json",
+        url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        return {"error": stderr.decode("utf-8", errors="replace").strip()[:500]}
+
+    try:
+        info = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {"error": "Failed to parse yt-dlp output"}
+
+    # Find the actual downloaded file
+    video_id = info.get("id", "unknown")
+    ext = info.get("ext", "mp4")
+    file_path = Path(output_path).parent / f"{video_id}.{ext}"
+
+    # Try to find the file with any extension
+    if not file_path.exists():
+        parent = Path(output_path).parent
+        for f in parent.glob(f"{video_id}.*"):
+            file_path = f
+            break
+
+    return {
+        "file_path": str(file_path),
+        "title": info.get("title", ""),
+        "thumbnail": info.get("thumbnail", ""),
+        "duration": info.get("duration", 0),
+        "filesize": info.get("filesize") or info.get("filesize_approx"),
+        "formats": info.get("formats", []),
+    }
+
+
+async def yt_dlp_formats(url: str) -> list:
+    """Get available formats for a video."""
+    cmd = [
+        "yt-dlp",
+        "--encoding", "utf-8",
+        "-J",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-colors",
+        url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return []
+
+    try:
+        info = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return []
+
+    formats = info.get("formats", [])
+    # Filter to unique video+audio combinations
+    seen = set()
+    result = []
+    for f in formats:
+        height = f.get("height")
+        ext = f.get("ext", "")
+        vcodec = f.get("vcodec", "none")
+        acodec = f.get("acodec", "none")
+
+        if ext in ("mhtml", "storyboard"):
+            continue
+
+        # Only include formats that have video or are audio-only
+        if vcodec == "none" and acodec == "none":
+            continue
+
+        key = f"{height or 'audio'}_{ext}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        label = ""
+        if height:
+            label = f"{height}p"
+            fps = f.get("fps")
+            if fps and fps > 30:
+                label += f" {int(fps)}fps"
+        elif vcodec == "none":
+            abr = f.get("abr", 0)
+            label = f"Audio {int(abr)}k" if abr else "Audio"
+
+        if label:
+            result.append({
+                "label": label,
+                "format_id": f.get("format_id", ""),
+                "height": height,
+                "ext": ext,
+            })
+
+    # Sort by height (video) or keep audio at end
+    result.sort(key=lambda x: x.get("height") or 0, reverse=True)
+
+    # Add default options
+    options = [
+        {"label": "بهترین کیفیت", "format_id": "bv*+ba/b", "height": None, "ext": ""},
+    ]
+    for fmt in result[:8]:  # Max 8 quality options
+        options.append(fmt)
+
+    return options
 
 
 # --- Setup ---
@@ -130,87 +328,6 @@ def first_time_setup():
     return cfg
 
 
-# --- URL validation ---
-def extract_url(text: str) -> str | None:
-    url_pattern = re.compile(r"https?://[^\s<>\"']+")
-    match = url_pattern.search(text)
-    return match.group(0) if match else None
-
-
-# --- Download ---
-async def download_video(url: str, output_dir: Path) -> dict:
-    """Download video using yt-dlp. Returns dict with file_path, title, thumbnail, duration."""
-    output_template = str(output_dir / "%(id)s.%(ext)s")
-
-    cmd = [
-        "yt-dlp",
-        "--encoding", "utf-8",
-        "-f", "bv*+ba/b",
-        "-o", output_template,
-        "--no-playlist",
-        "--print-json",
-        "--no-warnings",
-        "--no-colors",
-        "--restrict-filenames",
-        "--merge-output-format", "mp4",
-        url,
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-
-    if proc.returncode != 0:
-        error_msg = stderr.decode("utf-8", errors="replace").strip()
-        return {"error": error_msg or "Download failed"}
-
-    try:
-        info = json.loads(stdout.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return {"error": "Failed to parse yt-dlp output"}
-
-    video_id = info.get("id", "unknown")
-    ext = info.get("ext", "mp4")
-    file_path = output_dir / f"{video_id}.{ext}"
-
-    if not file_path.exists():
-        for f in output_dir.glob(f"{video_id}.*"):
-            file_path = f
-            break
-
-    return {
-        "file_path": str(file_path),
-        "title": info.get("title", ""),
-        "thumbnail": info.get("thumbnail", ""),
-        "duration": info.get("duration", 0),
-        "filesize": info.get("filesize") or info.get("filesize_approx"),
-    }
-
-
-def format_duration(seconds):
-    if not seconds:
-        return ""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    if h > 0:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
-
-
-def format_size(size_bytes):
-    if not size_bytes:
-        return "نامشخص"
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f} TB"
-
-
 # --- Handlers ---
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -219,6 +336,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📥 دانلود ویدیو", callback_data="menu_download")],
         [InlineKeyboardButton("👤 پروفایل من", callback_data="menu_profile")],
+        [InlineKeyboardButton("📋 پشتیبانی از سایت‌ها", callback_data="menu_sites")],
     ]
 
     if user.id == cfg["admin_id"]:
@@ -228,8 +346,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"سلام {user.first_name}! 👋\n\n"
-        "🎬 ربات دانلود ویدیو آپارات کودک\n\n"
-        "لینک ویدیو رو بفرست تا دانلود کنم!"
+        "🎬 ربات دانلود ویدیو\n\n"
+        "لینک ویدیو رو بفرست تا دانلود کنم!\n\n"
+        "🌐 سایت‌های پشتیبانی شده:\n"
+        "آپارات • یوتیوپ • اینستاگرام • تیک‌تاک\n"
+        "توییتر • فیسبوک • ردیت • توییچ • ساندکلود"
     )
 
     if update.callback_query:
@@ -241,17 +362,57 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📖 راهنما:\n\n"
-        "1️⃣ لینک ویدیوی آپارات یا آپارات کودک رو بفرست\n"
-        "2️⃣ ربات ویدیو رو دانلود و ارسال می‌کنه\n\n"
+        "1️⃣ لینک ویدیو بفرست\n"
+        "2️⃣ کیفیت دلخواه رو انتخاب کن\n"
+        "3️⃣ ویدیو دانلود و ارسال میشه\n\n"
+        "📋 پلی‌لیست:\n"
+        "• لینک پلی‌لیست بفرست\n"
+        "• لیست ویدیوها نمایش داده میشه\n"
+        "• دانلود تکی یا دانلود همه\n\n"
         "🌐 سایت‌های پشتیبانی شده:\n"
-        "• aparat.com\n"
-        "• aparatkids.com\n\n"
+        "آپارات • آپارات کودک • یوتیوپ\n"
+        "اینستاگرام • تیک‌تاک • توییتر\n"
+        "فیسبوک • ردیت • توییچ • ساندکلود\n\n"
         "📋 محدودیت‌ها:\n"
         "• کاربر عادی: ۵ دانلود در روز\n"
         "• کاربر ویژه: نامحدود\n"
         "• مدیر: نامحدود"
     )
     await update.message.reply_text(text)
+
+
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = load_config()
+    if update.effective_user.id != cfg["admin_id"]:
+        await update.message.reply_text("⛔ فقط مدیر می‌تونه آپدیت کنه.")
+        return
+
+    status = await update.message.reply_text("🔄 در حال آپدیت...")
+
+    proc = await asyncio.create_subprocess_shell(
+        "cd /root/Downloader && git pull origin main",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    output = stdout.decode("utf-8", errors="replace").strip()
+
+    if "Already up to date" in output:
+        await status.edit_text("✅ کد آپدیت هست. نیازی به ریستارت نیست.")
+    elif proc.returncode == 0:
+        await status.edit_text(
+            f"✅ آپدیت شد!\n\n{output}\n\n"
+            "🔄 ریستارت سرویس..."
+        )
+        proc2 = await asyncio.create_subprocess_shell(
+            "systemctl restart aparatkids-bot",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc2.communicate()
+        await status.edit_text("✅ آپدیت و ریستارت انجام شد!")
+    else:
+        await status.edit_text(f"❌ خطا در آپدیت:\n{stderr.decode('utf-8', errors='replace')[:500]}")
 
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,7 +424,10 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_download":
         await query.edit_message_text(
             "📥 لینک ویدیو رو بفرست:\n\n"
-            "مثال:\nhttps://www.aparat.com/v/abc123",
+            "مثال:\n"
+            "https://www.aparat.com/v/abc123\n"
+            "https://www.youtube.com/watch?v=xyz\n"
+            "https://www.instagram.com/reel/xyz"
         )
 
     elif data == "menu_profile":
@@ -274,11 +438,29 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             f"👤 پروفایل شما:\n\n"
-            f"身份: {query.from_user.first_name}\n"
+            f"نام: {query.from_user.first_name}\n"
             f"شناسه: {user_id}\n"
             f"نقش: {role}\n"
             f"دانلود باقی‌مانده امروز: {limit_text}\n"
             f"دانلود امروز: {get_user_usage(user_id)}"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="menu_back")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "menu_sites":
+        text = (
+            "🌐 سایت‌های پشتیبانی شده:\n\n"
+            "✅ آپارات (aparat.com)\n"
+            "✅ آپارات کودک (aparatkids.com)\n"
+            "✅ یوتیوپ (youtube.com / youtu.be)\n"
+            "✅ اینستاگرام (instagram.com)\n"
+            "✅ تیک‌تاک (tiktok.com)\n"
+            "✅ توییتر / X (twitter.com / x.com)\n"
+            "✅ فیسبوک (facebook.com / fb.watch)\n"
+            "✅ ردیت (reddit.com / v.redd.it)\n"
+            "✅ دیلی‌موشن (dailymotion.com)\n"
+            "✅ توییچ (twitch.tv)\n"
+            "✅ ساندکلود (soundcloud.com)"
         )
         keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="menu_back")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -296,6 +478,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cfg["premium_users"].append(target_id)
             save_config(cfg)
         await query.answer("✅ کاربر ویژه شد!")
+        await show_admin_panel(query)
 
     elif data.startswith("admin_remove_premium_"):
         target_id = int(data.split("_")[-1])
@@ -304,6 +487,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cfg["premium_users"].remove(target_id)
             save_config(cfg)
         await query.answer("✅ از ویژه حذف شد!")
+        await show_admin_panel(query)
 
     elif data == "admin_list_users":
         await show_user_list(query)
@@ -311,8 +495,51 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_back":
         await show_admin_panel(query)
 
+    elif data.startswith("dl_one_"):
+        # Download single video from playlist
+        _, idx_str, playlist_id = data.split("|", 2)
+        idx = int(idx_str)
+        context.user_data["pending_playlist"] = playlist_id
+        context.user_data["pending_playlist_idx"] = idx
+        context.user_data["pending_action"] = "single"
+        await show_quality_selection(query, idx, playlist_id, context)
+
+    elif data.startswith("dl_all_"):
+        # Download all from playlist
+        _, playlist_id = data.split("|", 1)
+        context.user_data["pending_playlist"] = playlist_id
+        context.user_data["pending_action"] = "all"
+        await show_quality_selection(query, -1, playlist_id, context)
+
     elif data.startswith("dl_"):
-        await handle_download_callback(query, data, context)
+        # Single video download with quality
+        parts = data.split("|", 2)
+        if len(parts) == 3:
+            _, format_id, video_url = parts
+            context.user_data["dl_format"] = format_id
+            await do_download(query.from_user.id, video_url, format_id, query.message, context)
+
+    elif data.startswith("ql_"):
+        # Quality selected for playlist
+        parts = data.split("|", 2)
+        format_id = parts[1]
+        action = context.user_data.get("pending_action", "all")
+        playlist_id = context.user_data.get("pending_playlist", "")
+
+        if action == "single":
+            idx = context.user_data.get("pending_playlist_idx", 0)
+            playlist_info = context.user_data.get("playlist_info", {})
+            entries = playlist_info.get("entries", [])
+            if idx < len(entries):
+                entry = entries[idx]
+                url = entry.get("url") or entry.get("webpage_url", "")
+                await query.edit_message_text("⏳ در حال دانلود...")
+                await do_download(query.from_user.id, url, format_id, query.message, context)
+        else:
+            playlist_info = context.user_data.get("playlist_info", {})
+            entries = playlist_info.get("entries", [])
+            await query.edit_message_text(f"⏳ در حال دانلود {len(entries)} ویدیو...")
+            await download_playlist(query, entries, format_id, context)
 
 
 async def show_admin_panel(query):
@@ -334,6 +561,7 @@ async def show_admin_panel(query):
 
     keyboard = [
         [InlineKeyboardButton("👥 لیست کاربران", callback_data="admin_list_users")],
+        [InlineKeyboardButton("🔄 آپدیت ربات", callback_data="admin_update")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_back")],
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -345,18 +573,52 @@ async def show_user_list(query):
     today = get_today_key()
 
     text = "👥 لیست کاربران:\n\n"
-    for uid, data in usage.items():
+    for uid, data in sorted(usage.items(), key=lambda x: x[1].get(today, 0), reverse=True):
         count = data.get(today, 0)
-        role = "⭐" if int(uid) in cfg["premium_users"] else ("👑" if int(uid) == cfg["admin_id"] else "👤")
-        text += f"{role} ID: {uid} — امروز: {count}\n"
+        if int(uid) == cfg["admin_id"]:
+            role = "👑"
+        elif int(uid) in cfg["premium_users"]:
+            role = "⭐"
+        else:
+            role = "👤"
+        text += f"{role} `{uid}` — امروز: {count}\n"
+
+    if not usage:
+        text += "هنوز کاربری ثبت نشده.\n"
 
     keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
+async def show_quality_selection(query, idx, playlist_id, context):
+    """Show quality selection for a download."""
+    playlist_info = context.user_data.get("playlist_info", {})
+    entries = playlist_info.get("entries", [])
+
+    if idx >= 0 and idx < len(entries):
+        entry = entries[idx]
+        url = entry.get("url") or entry.get("webpage_url", "")
+        title = entry.get("title", f"ویدیو {idx + 1}")
+    else:
+        # For "download all", use the playlist URL
+        url = playlist_info.get("url", "")
+        title = f"دانلود همه ({len(entries)} ویدیو)"
+
+    await query.edit_message_text(f"⏳ دریافت کیفیت‌های موجود...")
+
+    formats = await yt_dlp_formats(url)
+    if not formats:
+        formats = [{"label": "بهترین کیفیت", "format_id": "bv*+ba/b", "height": None, "ext": ""}]
+
+    keyboard = []
+    for fmt in formats:
+        keyboard.append([InlineKeyboardButton(
+            f"📹 {fmt['label']}",
+            callback_data=f"ql_|{fmt['format_id']}"
+        )])
+
+    text = f"🎬 {title}\n\nکیفیت مورد نظر رو انتخاب کن:"
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def handle_download_callback(query, data, context):
-    _, video_id, url = data.split("|", 2)
-    await do_download(query.from_user.id, url, query.message, context)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,84 +629,214 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ لطفاً یک لینک معتبر بفرستید.")
         return
 
-    if not is_aparat_url(url):
+    if not is_allowed_url(url):
         await update.message.reply_text(
             "❌ این لینک پشتیبانی نمی‌شود.\n\n"
-            "فقط لینک‌های aparat.com و aparatkids.com مجاز هستند."
+            "لیست سایت‌های مجاز:\n"
+            "آپارات • یوتیوپ • اینستاگرام\n"
+            "تیک‌تاک • توییتر • فیسبوک • ردیت"
         )
         return
 
-    await do_download(update.effective_user.id, url, update.message, context)
-
-
-async def do_download(user_id: int, url: str, message, context):
-    if not can_download(user_id):
-        await message.reply_text(
+    if not can_download(update.effective_user.id):
+        await update.message.reply_text(
             "⛔ سقف دانلود روزانه شما تمام شده.\n"
             "برای افزایش سقف با مدیر تماس بگیرید."
         )
         return
 
+    # Check if it might be a playlist
+    status_msg = await update.message.reply_text("🔍 در حال بررسی لینک...")
+
+    info = await yt_dlp_info(url)
+
+    if info and info.get("_type") == "playlist":
+        # It's a playlist - show the list
+        entries = info.get("entries", [])
+        context.user_data["playlist_info"] = info
+        context.user_data["pending_action"] = "all"
+
+        playlist_title = info.get("title", "پلی‌لیست")
+        text = f"📋 {playlist_title}\n\n"
+        text += f"تعداد ویدیوها: {len(entries)}\n\n"
+        text += "ویدیوها:\n"
+        for i, entry in enumerate(entries[:20]):  # Show max 20
+            title = entry.get("title", f"ویدیو {i+1}")
+            text += f"  {i+1}. {title}\n"
+        if len(entries) > 20:
+            text += f"  ... و {len(entries) - 20} ویدیوی دیگر\n"
+
+        keyboard = [
+            [InlineKeyboardButton(f"📥 دانلود همه ({len(entries)})", callback_data=f"dl_all_|{url}")],
+        ]
+        for i, entry in enumerate(entries[:10]):  # Max 10 individual buttons
+            title = entry.get("title", f"ویدیو {i+1}")[:30]
+            keyboard.append([InlineKeyboardButton(
+                f"📹 {i+1}. {title}",
+                callback_data=f"dl_one_|{i}|{url}"
+            )])
+
+        await status_msg.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        # Single video - show quality selection
+        context.user_data["playlist_info"] = {"entries": [{"url": url}], "url": url}
+        await show_quality_selection(status_msg, 0, url, context)
+
+
+async def do_download(user_id: int, url: str, format_id: str, message, context):
+    if not can_download(user_id):
+        await message.reply_text("⛔ سقف دانلود روزانه شما تمام شده.")
+        return
+
     cfg = load_config()
 
-    status_msg = await message.reply_text("⏳ در حال دانلود ویدیو...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        status_msg = await message.reply_text("⏳ در حال دانلود ویدیو...")
 
-    try:
-        result = await asyncio.wait_for(
-            download_video(url, DOWNLOAD_DIR),
-            timeout=120,
+        result = await yt_dlp_download(
+            url,
+            os.path.join(tmpdir, "%(id)s.%(ext)s"),
+            format_spec=format_id,
         )
-    except asyncio.TimeoutError:
-        await status_msg.edit_text("⏰ دانلود بیش از حد طول کشید. دوباره تلاش کنید.")
-        return
 
-    if "error" in result:
-        await status_msg.edit_text(f"❌ خطا در دانلود:\n{result['error'][:500]}")
-        return
+        if "error" in result:
+            await status_msg.edit_text(f"❌ خطا در دانلود:\n{result['error'][:500]}")
+            return
 
-    file_path = result["file_path"]
-    title = result["title"] or "ویدیو"
-    duration = format_duration(result.get("duration"))
-    size = format_size(result.get("filesize"))
+        file_path = result["file_path"]
+        title = result["title"] or "ویدیو"
+        duration = format_duration(result.get("duration"))
+        size = format_size(result.get("filesize"))
 
-    if not os.path.exists(file_path):
-        await status_msg.edit_text("❌ فایل ویدیو یافت نشد.")
-        return
+        if not os.path.exists(file_path):
+            await status_msg.edit_text("❌ فایل ویدیو یافت نشد.")
+            return
 
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    if file_size_mb > cfg["max_file_size_mb"]:
-        await status_msg.edit_text(
-            f"❌ حجم فایل ({file_size_mb:.1f} MB) بیشتر از حد مجاز ({cfg['max_file_size_mb']} MB) است."
-        )
-        os.remove(file_path)
-        return
-
-    caption = f"🎬 {title}"
-    if duration:
-        caption += f"\n⏱ {duration}"
-    caption += f"\n📦 {size}"
-
-    try:
-        with open(file_path, "rb") as f:
-            await message.reply_video(
-                video=f,
-                caption=caption,
-                read_timeout=300,
-                write_timeout=300,
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        if file_size_mb > cfg["max_file_size_mb"]:
+            await status_msg.edit_text(
+                f"❌ حجم فایل ({file_size_mb:.1f} MB) بیشتر از حد مجاز ({cfg['max_file_size_mb']} MB) است."
             )
-        await status_msg.delete()
-        increment_user_usage(user_id)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ خطا در ارسال فایل:\n{str(e)[:300]}")
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+            return
+
+        caption = f"🎬 {title}"
+        if duration:
+            caption += f"\n⏱ {duration}"
+        caption += f"\n📦 {size}"
+
+        try:
+            with open(file_path, "rb") as f:
+                if file_size_mb <= 50:
+                    await message.reply_video(
+                        video=f,
+                        caption=caption,
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
+                else:
+                    await message.reply_document(
+                        document=f,
+                        caption=caption,
+                        read_timeout=300,
+                        write_timeout=300,
+                    )
+            await status_msg.delete()
+            increment_user_usage(user_id)
+        except Exception as e:
+            await status_msg.edit_text(f"❌ خطا در ارسال فایل:\n{str(e)[:300]}")
+
+
+async def download_playlist(query, entries, format_id, context):
+    """Download all videos in a playlist."""
+    user_id = query.from_user.id
+    cfg = load_config()
+
+    total = len(entries)
+    success = 0
+    failed = 0
+
+    for i, entry in enumerate(entries):
+        url = entry.get("url") or entry.get("webpage_url", "")
+        title = entry.get("title", f"ویدیو {i+1}")
+
+        if not url:
+            failed += 1
+            continue
+
+        if not can_download(user_id):
+            await query.edit_message_text(
+                f"⛔ سقف دانلود تمام شد!\n"
+                f"✅ موفق: {success}/{total}\n"
+                f"❌ ناموفق: {failed}/{total}"
+            )
+            return
+
+        try:
+            await query.edit_message_text(
+                f"⏳ دانلود {i+1}/{total}...\n"
+                f"📹 {title[:50]}"
+            )
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result = await yt_dlp_download(
+                    url,
+                    os.path.join(tmpdir, "%(id)s.%(ext)s"),
+                    format_spec=format_id,
+                )
+
+                if "error" in result:
+                    failed += 1
+                    continue
+
+                file_path = result["file_path"]
+                if not os.path.exists(file_path):
+                    failed += 1
+                    continue
+
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                if file_size_mb > cfg["max_file_size_mb"]:
+                    failed += 1
+                    continue
+
+                vtitle = result["title"] or title
+                caption = f"🎬 {vtitle} ({i+1}/{total})"
+
+                with open(file_path, "rb") as f:
+                    if file_size_mb <= 50:
+                        await query.message.reply_video(
+                            video=f,
+                            caption=caption,
+                            read_timeout=300,
+                            write_timeout=300,
+                        )
+                    else:
+                        await query.message.reply_document(
+                            document=f,
+                            caption=caption,
+                            read_timeout=300,
+                            write_timeout=300,
+                        )
+                increment_user_usage(user_id)
+                success += 1
+
+        except Exception:
+            failed += 1
+
+    await query.edit_message_text(
+        f"✅ دانلود پلی‌لیست تمام شد!\n\n"
+        f"✅ موفق: {success}/{total}\n"
+        f"❌ ناموفق: {failed}/{total}"
+    )
 
 
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "شروع / منوی اصلی"),
         BotCommand("help", "راهنما"),
+        BotCommand("update", "آپدیت ربات (فقط مدیر)"),
     ])
 
 
@@ -457,6 +849,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CallbackQueryHandler(cb_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

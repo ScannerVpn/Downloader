@@ -24,15 +24,15 @@ fi
 echo "[1/5] Installing system dependencies..."
 if [ "$PKG" = "apt-get" ]; then
     sudo apt-get update -qq
-    sudo apt-get install -y -qq python3 python3-venv ffmpeg
+    sudo apt-get install -y -qq python3 python3-venv ffmpeg git
 elif [ "$PKG" = "yum" ]; then
-    sudo yum install -y python3 ffmpeg
+    sudo yum install -y python3 ffmpeg git
 elif [ "$PKG" = "dnf" ]; then
-    sudo dnf install -y python3 ffmpeg
+    sudo dnf install -y python3 ffmpeg git
 elif [ "$PKG" = "apk" ]; then
-    apk add python3 py3-pip ffmpeg
+    apk add python3 py3-pip ffmpeg git
 elif [ "$PKG" = "pacman" ]; then
-    sudo pacman -S --noconfirm python ffmpeg
+    sudo pacman -S --noconfirm python ffmpeg git
 fi
 
 echo "[2/5] Setting up Python virtual environment..."
@@ -40,6 +40,9 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip -q
 pip install -r requirements.txt -q
+
+# Install yt-dlp via pip (always latest version)
+pip install -U yt-dlp -q
 
 echo "[3/5] Configuring bot..."
 python3 -c "
