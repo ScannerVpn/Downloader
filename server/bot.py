@@ -709,10 +709,10 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
         return
 
     cfg = load_config()
+    tmpdir = tempfile.mkdtemp()
+    status_msg = await message.reply_text("⏳ در حال دانلود ویدیو...")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        status_msg = await message.reply_text("⏳ در حال دانلود ویدیو...")
-
+    try:
         result = await yt_dlp_download(
             url,
             os.path.join(tmpdir, "%(id)s.%(ext)s"),
@@ -728,9 +728,15 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
         duration = format_duration(result.get("duration"))
         size = format_size(result.get("filesize"))
 
-        if not os.path.exists(file_path):
-            await status_msg.edit_text("❌ فایل ویدیو یافت نشد.")
-            return
+        if not file_path or not os.path.exists(file_path):
+            # Try to find the file
+            for f in Path(tmpdir).glob("*.*"):
+                if f.suffix in (".mp4", ".mkv", ".webm", ".avi", ".mov"):
+                    file_path = str(f)
+                    break
+            else:
+                await status_msg.edit_text("❌ فایل ویدیو یافت نشد.")
+                return
 
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         if file_size_mb > cfg["max_file_size_mb"]:
@@ -744,27 +750,26 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
             caption += f"\n⏱ {duration}"
         caption += f"\n📦 {size}"
 
+        await status_msg.edit_text(f"📤 در حال آپلود ({file_size_mb:.0f} MB)...")
+
+        with open(file_path, "rb") as f:
+            await message.reply_video(
+                video=f,
+                caption=caption,
+                read_timeout=600,
+                write_timeout=600,
+                connect_timeout=30,
+            )
+        await status_msg.delete()
+        increment_user_usage(user_id)
+    except Exception as e:
         try:
-            await status_msg.edit_text(f"📤 در حال آپلود ({file_size_mb:.0f} MB)...")
-            with open(file_path, "rb") as f:
-                if file_size_mb <= 2000:
-                    await message.reply_video(
-                        video=f,
-                        caption=caption,
-                        read_timeout=600,
-                        write_timeout=600,
-                    )
-                else:
-                    await message.reply_document(
-                        document=f,
-                        caption=caption,
-                        read_timeout=600,
-                        write_timeout=600,
-                    )
-            await status_msg.delete()
-            increment_user_usage(user_id)
-        except Exception as e:
             await status_msg.edit_text(f"❌ خطا در ارسال فایل:\n{str(e)[:300]}")
+        except Exception:
+            pass
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def download_playlist(query, entries, format_id, context):
@@ -784,11 +789,14 @@ async def download_playlist(query, entries, format_id, context):
     for i, entry in enumerate(entries):
         # Check cancel
         if context.user_data.get("cancel_download"):
-            await query.edit_message_text(
-                f"🚫 دانلود لغو شد!\n\n"
-                f"✅ موفق: {success}/{total}\n"
-                f"❌ ناموفق: {failed}/{total}"
-            )
+            try:
+                await query.edit_message_text(
+                    f"🚫 دانلود لغو شد!\n\n"
+                    f"✅ موفق: {success}/{total}\n"
+                    f"❌ ناموفق: {failed}/{total}"
+                )
+            except Exception:
+                pass
             return
 
         url = entry.get("url") or entry.get("webpage_url", "")
@@ -799,88 +807,109 @@ async def download_playlist(query, entries, format_id, context):
             continue
 
         if not can_download(user_id):
-            await query.edit_message_text(
-                f"⛔ سقف دانلود تمام شد!\n"
-                f"✅ موفق: {success}/{total}\n"
-                f"❌ ناموفق: {failed}/{total}"
-            )
+            try:
+                await query.edit_message_text(
+                    f"⛔ سقف دانلود تمام شد!\n"
+                    f"✅ موفق: {success}/{total}\n"
+                    f"❌ ناموفق: {failed}/{total}"
+                )
+            except Exception:
+                pass
             return
 
+        progress_pct = int(((i) / total) * 100)
+        progress_bar = "█" * (progress_pct // 5) + "░" * (20 - progress_pct // 5)
         try:
-            progress_pct = int((i / total) * 100)
-            progress_bar = "█" * (progress_pct // 5) + "░" * (20 - progress_pct // 5)
             await query.edit_message_text(
                 f"⏳ دانلود {i + 1}/{total} — {title[:40]}\n"
                 f"{progress_bar} {progress_pct}%",
                 reply_markup=cancel_keyboard,
             )
+        except Exception:
+            pass
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                result = await yt_dlp_download(
-                    url,
-                    os.path.join(tmpdir, "%(id)s.%(ext)s"),
-                    format_spec=format_id,
-                )
+        tmpdir = tempfile.mkdtemp()
+        try:
+            result = await yt_dlp_download(
+                url,
+                os.path.join(tmpdir, "%(id)s.%(ext)s"),
+                format_spec=format_id,
+            )
 
-                if "error" in result:
+            if "error" in result:
+                failed += 1
+                continue
+
+            file_path = result["file_path"]
+            if not file_path or not os.path.exists(file_path):
+                for f in Path(tmpdir).glob("*.*"):
+                    if f.suffix in (".mp4", ".mkv", ".webm", ".avi", ".mov"):
+                        file_path = str(f)
+                        break
+                else:
                     failed += 1
                     continue
 
-                file_path = result["file_path"]
-                if not os.path.exists(file_path):
-                    failed += 1
-                    continue
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            if file_size_mb > cfg["max_file_size_mb"]:
+                failed += 1
+                continue
 
-                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                if file_size_mb > cfg["max_file_size_mb"]:
-                    failed += 1
-                    continue
+            vtitle = result["title"] or title
+            duration = format_duration(result.get("duration"))
+            size = format_size(result.get("filesize"))
+            caption = f"🎬 {vtitle} ({i + 1}/{total})"
+            if duration and duration != "0:00":
+                caption += f"\n⏱ {duration}"
+            caption += f"\n📦 {size}"
 
-                vtitle = result["title"] or title
-                duration = format_duration(result.get("duration"))
-                size = format_size(result.get("filesize"))
-                caption = f"🎬 {vtitle} ({i + 1}/{total})"
-                if duration and duration != "0:00":
-                    caption += f"\n⏱ {duration}"
-                caption += f"\n📦 {size}"
-
-                # Update status to show upload
+            # Check cancel before upload
+            if context.user_data.get("cancel_download"):
                 try:
                     await query.edit_message_text(
-                        f"📤 آپلود {i + 1}/{total} — {vtitle[:40]}\n"
-                        f"{progress_bar} {progress_pct}%\n"
-                        f"📦 {size}",
-                        reply_markup=cancel_keyboard,
+                        f"🚫 دانلود لغو شد!\n\n"
+                        f"✅ موفق: {success}/{total}\n"
+                        f"❌ ناموفق: {failed}/{total}"
                     )
                 except Exception:
                     pass
+                return
 
-                with open(file_path, "rb") as f:
-                    if file_size_mb <= 2000:
-                        await query.message.reply_video(
-                            video=f,
-                            caption=caption,
-                            read_timeout=600,
-                            write_timeout=600,
-                        )
-                    else:
-                        await query.message.reply_document(
-                            document=f,
-                            caption=caption,
-                            read_timeout=600,
-                            write_timeout=600,
-                        )
-                increment_user_usage(user_id)
-                success += 1
+            # Show upload status
+            try:
+                await query.edit_message_text(
+                    f"📤 آپلود {i + 1}/{total} — {vtitle[:40]}\n"
+                    f"📦 {size}",
+                    reply_markup=cancel_keyboard,
+                )
+            except Exception:
+                pass
+
+            with open(file_path, "rb") as f:
+                await query.message.reply_video(
+                    video=f,
+                    caption=caption,
+                    read_timeout=600,
+                    write_timeout=600,
+                    connect_timeout=30,
+                )
+            increment_user_usage(user_id)
+            success += 1
 
         except Exception:
             failed += 1
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
-    await query.edit_message_text(
-        f"✅ دانلود پلی‌لیست تمام شد!\n\n"
-        f"✅ موفق: {success}/{total}\n"
-        f"❌ ناموفق: {failed}/{total}"
-    )
+    try:
+        await query.edit_message_text(
+            f"✅ دانلود پلی‌لیست تمام شد!\n\n"
+            f"✅ موفق: {success}/{total}\n"
+            f"❌ ناموفق: {failed}/{total}"
+        )
+    except Exception:
+        pass
 
 
 async def cb_cancel_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
