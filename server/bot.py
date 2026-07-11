@@ -182,6 +182,73 @@ async def yt_dlp_info(url: str) -> dict | None:
         return None
 
 
+async def fetch_aparat_playlist(url: str) -> list:
+    """Fetch aparat playlist entries via API (detect ?playlist= param)."""
+    import re as _re
+    match = _re.search(r"[?&]playlist=(\d+)", url)
+    if not match:
+        return []
+
+    # Extract video hash from URL
+    vid_match = _re.search(r"aparat\.com/v/([a-zA-Z0-9]+)", url)
+    if not vid_match:
+        return []
+    video_hash = vid_match.group(1)
+
+    api_url = f"https://www.aparat.com/api/fa/v1/video/video/show/videohash/{video_hash}?pr=1&mf=1"
+
+    cmd = [
+        "curl", "-s", "-H", "Referer: https://www.aparat.com/",
+        "-H", "Accept: application/json", api_url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+
+    try:
+        data = json.loads(stdout.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return []
+
+    # Find playlist in included and extract video IDs
+    included = data.get("included", [])
+    playlist = None
+    for item in included:
+        if item.get("type") == "playlist":
+            playlist = item
+            break
+
+    if not playlist:
+        return []
+
+    video_ids = [
+        v["id"] for v in playlist.get("relationships", {}).get("video", {}).get("data", [])
+    ]
+
+    # Map video IDs to UIDs
+    id_to_uid = {}
+    for item in included:
+        if item.get("type") == "Video":
+            vid_id = item.get("id", "")
+            uid = item.get("attributes", {}).get("uid", "")
+            if vid_id and uid:
+                id_to_uid[vid_id] = uid
+
+    entries = []
+    for vid_id in video_ids:
+        uid = id_to_uid.get(vid_id)
+        if uid:
+            entries.append({
+                "url": f"https://www.aparat.com/v/{uid}",
+                "title": "",  # Will be filled during download
+            })
+
+    return entries
+
+
 async def yt_dlp_download(url: str, output_path: str, format_spec: str = "bv*+ba/b") -> dict:
     """Download a single video using yt-dlp."""
     cmd = [
@@ -665,7 +732,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if it might be a playlist
     status_msg = await update.message.reply_text("🔍 در حال بررسی لینک...")
 
-    info = await yt_dlp_info(url)
+    # First check for aparat playlist URLs
+    aparat_entries = await fetch_aparat_playlist(url)
+    if aparat_entries:
+        info = {"_type": "playlist", "entries": aparat_entries, "url": url, "title": "آپارات پلی‌لیست"}
+    else:
+        info = await yt_dlp_info(url)
 
     if info and info.get("_type") == "playlist":
         # It's a playlist - show the list
@@ -740,7 +812,7 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
             return
 
         caption = f"🎬 {title}"
-        if duration:
+        if duration and duration != "0:00":
             caption += f"\n⏱ {duration}"
         caption += f"\n📦 {size}"
 
@@ -777,7 +849,7 @@ async def download_playlist(query, entries, format_id, context):
 
     for i, entry in enumerate(entries):
         url = entry.get("url") or entry.get("webpage_url", "")
-        title = entry.get("title", f"ویدیو {i+1}")
+        title = entry.get("title", f"ویدیو {i + 1}")
 
         if not url:
             failed += 1
@@ -792,8 +864,11 @@ async def download_playlist(query, entries, format_id, context):
             return
 
         try:
+            progress_pct = int((i / total) * 100)
+            progress_bar = "█" * (progress_pct // 5) + "░" * (20 - progress_pct // 5)
             await query.edit_message_text(
-                f"⏳ دانلود {i+1}/{total}...\n"
+                f"⏳ دانلود {i + 1}/{total}\n"
+                f"{progress_bar} {progress_pct}%\n"
                 f"📹 {title[:50]}"
             )
 
@@ -819,7 +894,7 @@ async def download_playlist(query, entries, format_id, context):
                     continue
 
                 vtitle = result["title"] or title
-                caption = f"🎬 {vtitle} ({i+1}/{total})"
+                caption = f"🎬 {vtitle} ({i + 1}/{total})"
 
                 with open(file_path, "rb") as f:
                     if file_size_mb <= 50:
