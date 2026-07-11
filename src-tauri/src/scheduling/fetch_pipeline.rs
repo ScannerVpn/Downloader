@@ -246,6 +246,9 @@ async fn handle_fetch_entry(
         if meta.duration.is_some() {
           single.duration = meta.duration;
         }
+        if meta.filesize.is_some() {
+          single.filesize = meta.filesize;
+        }
         // Always use the original page URL for display
         single.url = Some(url.clone());
       }

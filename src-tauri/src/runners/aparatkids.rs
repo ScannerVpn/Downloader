@@ -19,6 +19,7 @@ pub struct AparatkidsResolved {
   pub title: Option<String>,
   pub thumbnail: Option<String>,
   pub duration: Option<f64>,
+  pub filesize: Option<u64>,
 }
 
 pub fn is_aparatkids_url(url: &str) -> bool {
@@ -99,11 +100,39 @@ async fn resolve_aparat_video(
     .and_then(|v| v.as_f64())
     .filter(|&d| d > 0.0);
 
+  // Try to extract filesize from API response
+  let filesize = attrs
+    .get("filesize")
+    .or_else(|| attrs.get("size"))
+    .and_then(|v| v.as_u64())
+    .filter(|&s| s > 0)
+    .or_else(|| {
+      // Some APIs return duration in seconds and bitrate, estimate filesize
+      let dur = duration?;
+      let bitrate = attrs
+        .get("bitrate")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+          attrs
+            .get("encodings")
+            .and_then(|e| e.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|e| e.get("bitrate"))
+            .and_then(|v| v.as_u64())
+        })?;
+      if bitrate > 0 {
+        Some((dur * bitrate as f64 / 8.0) as u64)
+      } else {
+        None
+      }
+    });
+
   Ok(AparatkidsResolved {
     m3u8_url,
     title,
     thumbnail,
     duration,
+    filesize,
   })
 }
 
@@ -178,11 +207,20 @@ async fn resolve_aparat_movie(
         .filter(|&d| d > 0.0)
     });
 
+  // Try to extract filesize from movie data
+  let filesize = movie_data
+    .get("playerOption")
+    .and_then(|p| p.get("filesize"))
+    .or_else(|| movie_data.get("playerOption").and_then(|p| p.get("size")))
+    .and_then(|v| v.as_u64())
+    .filter(|&s| s > 0);
+
   Ok(AparatkidsResolved {
     m3u8_url,
     title,
     thumbnail,
     duration,
+    filesize,
   })
 }
 
@@ -266,6 +304,7 @@ async fn resolve_aparatkids_com(
     title,
     thumbnail,
     duration,
+    filesize: None,
   })
 }
 

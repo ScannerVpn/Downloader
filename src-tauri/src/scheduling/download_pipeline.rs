@@ -1,6 +1,7 @@
 use crate::models::download::{DownloadOverrides, FormatOptions};
 use crate::models::DownloadItem;
 use crate::models::SubtitleInventory;
+use crate::runners::aparatkids::{is_aparatkids_url, resolve_aparatkids_url};
 use crate::runners::template_context::TemplateContext;
 use crate::runners::ytdlp_download::{run_ytdlp_download, YtdlpDownloadError};
 use crate::scheduling::concurrency::DynamicSemaphore;
@@ -92,6 +93,33 @@ pub fn setup_download_dispatcher(
       }
     },
     |tx, app: AppHandle, entry: DownloadEntry| async move {
+      // Resolve AparatKids/Aparat URLs to direct m3u8 links before passing to yt-dlp
+      let resolved_url = if is_aparatkids_url(&entry.url) {
+        match resolve_aparatkids_url(&entry.url).await {
+          Ok(resolved) => {
+            tracing::info!(
+              original = %entry.url,
+              resolved = %resolved.m3u8_url,
+              "Resolved AparatKids URL to m3u8 for download"
+            );
+            resolved.m3u8_url
+          }
+          Err(e) => {
+            tracing::warn!(
+              url = %entry.url,
+              error = %e,
+              "Failed to resolve AparatKids URL for download, using original"
+            );
+            entry.url.clone()
+          }
+        }
+      } else {
+        entry.url.clone()
+      };
+
+      let mut entry = entry;
+      entry.url = resolved_url;
+
       tracing::info!("starting download id={} url={}", entry.id, entry.url);
 
       if let Err(e) = run_ytdlp_download(app.clone(), entry.clone()).await {
