@@ -74,6 +74,71 @@ def _cancel_keyboard():
     ])
 
 
+async def _file_progress_poller(
+    tmpdir: str,
+    edit_target,
+    get_base_text,
+    cancel_kb,
+    stop_event: "asyncio.Event",
+    min_interval: float = 1.2,
+):
+    """Background task: poll the size of files `yt-dlp` is writing in `tmpdir`
+    and update the Telegram status message. This complements the
+    `[download] X%` regex-driven callback so we still show progress when
+    yt-dlp delegates the download to ffmpeg (HLS / DASH / segmented
+    streams) and never emits a percent line.
+
+    Stops cleanly once `stop_event` is set or it is cancelled.
+    """
+    if hasattr(edit_target, "edit_message_text"):
+        edit_fn = edit_target.edit_message_text
+    elif hasattr(edit_target, "edit_text"):
+        edit_fn = edit_target.edit_text
+    else:
+        return
+
+    last_bytes = -1
+    last_edit = 0.0
+    last_text: str | None = None
+    tmp_path = Path(tmpdir)
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=min_interval)
+            break  # stop_event was set during the sleep
+        except asyncio.TimeoutError:
+            pass
+
+        total_bytes = 0
+        try:
+            for f in tmp_path.iterdir():
+                if f.is_file():
+                    total_bytes += f.stat().st_size
+        except Exception:
+            continue
+
+        if total_bytes <= 0:
+            continue
+        if total_bytes == last_bytes:
+            continue
+
+        now = time.monotonic()
+        if now - last_edit < min_interval:
+            continue
+        last_edit = now
+        last_bytes = total_bytes
+
+        size_text = format_size(total_bytes)
+        text = f"{get_base_text()}\n📦 {size_text} \u2014 در حال دریافت..."
+        if text == last_text:
+            continue
+        try:
+            await edit_fn(text, reply_markup=cancel_kb)
+            last_text = text
+        except Exception:
+            pass
+
+
 def load_config():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -844,7 +909,19 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
     context.user_data["cancel_download"] = False
     proc_holder = context.user_data["dl_proc_holder"] = {}
 
+    # Background poller: shows progress even when yt-dlp delegates the
+    # download to ffmpeg (HLS / DASH) and never emits `[download] X%`.
+    stop_poller = asyncio.Event()
     url_hint = url[:60]
+    poller_task = asyncio.create_task(
+        _file_progress_poller(
+            tmpdir=tmpdir,
+            edit_target=status_msg,
+            get_base_text=lambda: f"⏳ در حال دانلود\n🔗 {url_hint}",
+            cancel_kb=cancel_kb,
+            stop_event=stop_poller,
+        )
+    )
     last_edit = [0.0]
     bar_pct = [-1.0]
 
@@ -960,6 +1037,12 @@ async def do_download(user_id: int, url: str, format_id: str, message, context):
             pass
     finally:
         import shutil
+        stop_poller.set()
+        poller_task.cancel()
+        try:
+            await poller_task
+        except (asyncio.CancelledError, Exception):
+            pass
         context.user_data.pop("dl_proc_holder", None)
         context.user_data["cancel_download"] = False
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1045,6 +1128,18 @@ async def download_playlist(query, entries, format_id, context):
                 pass
 
         tmpdir = tempfile.mkdtemp()
+        # Background poller: shows progress even when yt-dlp uses ffmpeg
+        # (HLS / segmented streams) and emits no `[download] X%` lines.
+        stop_poller = asyncio.Event()
+        poller_task = asyncio.create_task(
+            _file_progress_poller(
+                tmpdir=tmpdir,
+                edit_target=query,
+                get_base_text=lambda: f"⏳ دانلود {i + 1}/{total} — {title[:40]}",
+                cancel_kb=cancel_kb,
+                stop_event=stop_poller,
+            )
+        )
         try:
             result = await yt_dlp_download(
                 url,
@@ -1157,6 +1252,12 @@ async def download_playlist(query, entries, format_id, context):
                 pass
         finally:
             import shutil
+            stop_poller.set()
+            poller_task.cancel()
+            try:
+                await poller_task
+            except (asyncio.CancelledError, Exception):
+                pass
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     # Always clear the proc holder so a stale cancelled state from a
