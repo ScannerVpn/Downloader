@@ -1,7 +1,7 @@
 [package]
-name = "aparatkids-downloader"
+name = "videohunter"
 version = "1.0.0"
-description = "Download videos from AparatKids and YouTube."
+description = "Download videos from YouTube, AparatKids, and 1000+ other sites."
 license = "AGPL-3.0-or-later"
 authors = ["Jelle Glebbeek"]
 edition = "2021"
@@ -12,7 +12,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant, but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "aparatkids_downloader_lib"
+name = "videohunter_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

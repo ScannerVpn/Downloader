@@ -2,7 +2,7 @@
 :menu
 cls
 echo ==============================
-echo   AparatKids Downloader
+echo   VideoHunter
 echo ==============================
 echo  1. Run Dev Mode
 echo  2. Build App

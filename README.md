@@ -1,6 +1,6 @@
-# AparatKids Downloader
+# VideoHunter
 
-Desktop application for downloading videos from **AparatKids** and **YouTube** (and hundreds of other sites via yt-dlp).
+Desktop application for downloading videos from **AparatKids**, **YouTube**, and hundreds of other sites via yt-dlp.
 
 Based on [Open Video Downloader](https://github.com/jely2002/youtube-dl-gui) with native AparatKids support.
 
@@ -89,13 +89,13 @@ Download the latest release from the [Releases page](https://github.com/ScannerV
 
 | Platform | File |
 |----------|------|
-| **Windows (x64)** | `AparatKids-Downloader_*_x64-setup.exe` |
-| **macOS (Intel)** | `AparatKids-Downloader_*_x64.dmg` |
-| **macOS (Apple Silicon)** | `AparatKids-Downloader_*_aarch64.dmg` |
-| **Linux (x64 AppImage)** | `AparatKids-Downloader_*_amd64.AppImage` |
-| **Linux (aarch64 AppImage)** | `AparatKids-Downloader_*_aarch64.AppImage` |
-| **Linux (Debian/Ubuntu x64)** | `AparatKids-Downloader_*_amd64.deb` |
-| **Linux (Fedora/RHEL x64)** | `AparatKids-Downloader_*_amd64.rpm` |
+| **Windows (x64)** | `VideoHunter_*_x64-setup.exe` |
+| **macOS (Intel)** | `VideoHunter_*_x64.dmg` |
+| **macOS (Apple Silicon)** | `VideoHunter_*_aarch64.dmg` |
+| **Linux (x64 AppImage)** | `VideoHunter_*_amd64.AppImage` |
+| **Linux (aarch64 AppImage)** | `VideoHunter_*_aarch64.AppImage` |
+| **Linux (Debian/Ubuntu x64)** | `VideoHunter_*_amd64.deb` |
+| **Linux (Fedora/RHEL x64)** | `VideoHunter_*_amd64.rpm` |
 
 ---
 

@@ -1,9 +1,9 @@
 {
-  "name": "aparatkids-downloader",
+  "name": "videohunter",
   "version": "1.0.0",
   "license": "AGPL-3.0-or-later",
   "type": "module",
-  "description": "Download videos from AparatKids and YouTube with a friendly GUI",
+  "description": "Download videos from YouTube, AparatKids, and 1000+ other sites with a friendly GUI",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jely2002/youtube-dl-gui.git"
