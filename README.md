@@ -6,6 +6,30 @@ Based on [Open Video Downloader](https://github.com/jely2002/youtube-dl-gui) wit
 
 ---
 
+## Quick Start (Windows)
+
+The easiest way to run or build the app on Windows is via `run.bat`:
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/ScannerVpn/Downloader.git
+   cd Downloader
+   ```
+
+2. Double-click **`run.bat`** or run it in a terminal:
+   ```
+   run.bat
+   ```
+
+3. Choose an option from the menu:
+   - **1 - Run Dev Mode** — starts the app in development mode with hot-reload
+   - **2 - Build App** — builds the production executable
+   - **3 - Exit**
+
+> **Note:** Requires Node.js v24+ and Rust (latest stable) installed.
+
+---
+
 ## Supported Platforms
 
 ### AparatKids (Native Support)
@@ -149,7 +173,7 @@ src/                          # Vue 3 Frontend
 src-tauri/                    # Rust Backend
   src/
     runners/
-      aparatkids.rs           # AparatKids URL resolver (NEW)
+      aparatkids.rs           # AparatKids URL resolver
       ytdlp_runner.rs         # yt-dlp process management
       ytdlp_info.rs           # Video metadata fetcher
       ytdlp_download.rs       # Video downloader
